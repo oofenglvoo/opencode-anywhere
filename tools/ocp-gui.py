@@ -303,14 +303,16 @@ def setup_style(app):
     style = tb.Style(theme="darkly") if HAS_TB else ttk.Style(app)
     if HAS_TB:
         c = style.colors
-        BG, CARD, FG = c.bg, _shift(c.bg, 8), c.fg
-        SIDEBAR, GRID, MENU_BG = _shift(c.bg, -12), c.border, _shift(c.bg, 12)
-        MUT = "#98a2ad"
-        ACCENT, ACCENT_DARK = c.primary, _shift(c.primary, -16)
-        SUCCESS, WARN, DANGER = c.success, c.warning, c.danger
-        SEL, ODD, EVEN = _shift(c.primary, 45), _shift(c.bg, -6), c.bg
-        RUN_BG, ACT_BG = "#14382c", "#3a2e12"
-        C_SUCCESS, C_WARNING, C_DANGER = c.success, c.warning, c.danger
+        # A quieter graphite canvas with a brighter indigo accent. The stock
+        # darkly blue is too low-contrast for a management dashboard.
+        BG, CARD, FG = "#11151c", "#1a202b", "#f3f6fb"
+        SIDEBAR, GRID, MENU_BG = "#0b0e13", "#2a3443", "#1d2430"
+        MUT = "#8d99aa"
+        ACCENT, ACCENT_DARK = "#788cff", "#5d70e6"
+        SUCCESS, WARN, DANGER = "#45d6a0", "#e5ad58", "#ef6f7b"
+        SEL, ODD, EVEN = "#293452", "#151b24", "#11151c"
+        RUN_BG, ACT_BG = "#173a35", "#3d3018"
+        C_SUCCESS, C_WARNING, C_DANGER = SUCCESS, WARN, DANGER
     else:
         try:
             style.theme_use("clam")
@@ -329,10 +331,22 @@ def setup_style(app):
         _f(fname, size=10)
     _f("TkHeadingFont", size=10, weight="bold")
     app.configure(bg=BG)
-    style.configure("Treeview", rowheight=32, borderwidth=0)
-    style.configure("Treeview.Heading", padding=(10, 8))
-    style.configure("TLabelframe", background=BG)
+    style.configure("TFrame", background=BG)
+    style.configure("Treeview", rowheight=34, borderwidth=0, relief="flat",
+                    background=EVEN, fieldbackground=EVEN, foreground=FG)
+    style.configure("Treeview.Heading", padding=(12, 10), background=CARD,
+                    foreground=MUT, relief="flat")
+    style.map("Treeview", background=[("selected", SEL)],
+              foreground=[("selected", FG)])
+    style.configure("TLabelframe", background=BG, bordercolor=GRID)
     style.configure("TLabelframe.Label", background=BG, foreground=MUT)
+    style.configure("Card.TFrame", background=CARD)
+    style.configure("PageTitle.TLabel", background=BG, foreground=FG,
+                    font=(UI_FONT, 20, "bold"))
+    style.configure("PageSubtitle.TLabel", background=BG, foreground=MUT,
+                    font=(UI_FONT, 9))
+    style.configure("Status.TLabel", background=CARD, foreground=MUT,
+                    padding=(12, 8))
     return style
 
 
@@ -1137,37 +1151,76 @@ class App(_AppBase):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        nav = tk.Frame(self, bg=SIDEBAR, width=186)
+        nav = tk.Frame(self, bg=SIDEBAR, width=232)
         nav.grid(row=0, column=0, sticky="ns")
         nav.grid_propagate(False)
-        tk.Label(nav, text="opencode 管理器", bg=SIDEBAR, fg=FG,
-                 font=(UI_FONT, 12, "bold")).pack(anchor="w", padx=18, pady=(20, 14))
+        brand = tk.Frame(nav, bg=SIDEBAR)
+        brand.pack(fill="x", padx=18, pady=(22, 28))
+        tk.Label(brand, text="O", bg=ACCENT, fg="#ffffff", width=2,
+                 font=(UI_FONT, 16, "bold"), padx=4, pady=2).pack(side="left")
+        brand_text = tk.Frame(brand, bg=SIDEBAR)
+        brand_text.pack(side="left", padx=(10, 0))
+        tk.Label(brand_text, text="opencode", bg=SIDEBAR, fg=FG,
+                 font=(UI_FONT, 14, "bold")).pack(anchor="w")
+        tk.Label(brand_text, text="会话与工作空间", bg=SIDEBAR, fg=MUT,
+                 font=(UI_FONT, 8)).pack(anchor="w")
+        tk.Label(nav, text="WORKSPACE", bg=SIDEBAR, fg="#5f6d80",
+                 font=(UI_FONT, 8, "bold"), anchor="w").pack(fill="x", padx=23, pady=(0, 8))
         self._navlbls = {}
         for text, key in NAV_ITEMS:
-            lbl = tk.Label(nav, text=text, bg=SIDEBAR, fg=MUT, anchor="w",
-                           font=(UI_FONT, 10), padx=22, pady=10, cursor="hand2")
+            lbl = tk.Label(nav, text="  " + text, bg=SIDEBAR, fg=MUT, anchor="w",
+                           font=(UI_FONT, 10), padx=22, pady=11, cursor="hand2")
             lbl.pack(fill="x")
             lbl.bind("<Button-1>", lambda e, k=key: self.show(k))
             lbl.bind("<Enter>", lambda e, k=key: self._nav_hover(k, True))
             lbl.bind("<Leave>", lambda e, k=key: self._nav_hover(k, False))
             self._navlbls[key] = lbl
-        self.badge_sync = tk.Label(nav, text="同步: -", bg=SIDEBAR, fg=MUT, anchor="w",
-                                   font=(UI_FONT, 9), padx=18)
-        self.badge_host = tk.Label(nav, text="主机: -", bg=SIDEBAR, fg=MUT, anchor="w",
-                                   font=(UI_FONT, 9), padx=18)
-        self.badge_run = tk.Label(nav, text="运行: -", bg=SIDEBAR, fg=MUT, anchor="w",
-                                  font=(UI_FONT, 9), padx=18)
+        status_card = tk.Frame(nav, bg=CARD, highlightthickness=1,
+                               highlightbackground=GRID)
+        status_card.pack(side="bottom", fill="x", padx=14, pady=(8, 18))
+        tk.Label(status_card, text="SYSTEM STATUS", bg=CARD, fg="#6f7d90",
+                 font=(UI_FONT, 8, "bold"), anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+        self.badge_sync = tk.Label(status_card, text="●  同步: -", bg=CARD, fg=MUT, anchor="w",
+                                   font=(UI_FONT, 9), padx=12)
+        self.badge_host = tk.Label(status_card, text="●  主机: -", bg=CARD, fg=MUT, anchor="w",
+                                   font=(UI_FONT, 9), padx=12)
+        self.badge_run = tk.Label(status_card, text="●  运行: -", bg=CARD, fg=MUT, anchor="w",
+                                  font=(UI_FONT, 9), padx=12)
         for bdg in (self.badge_run, self.badge_host, self.badge_sync):
-            bdg.pack(side="bottom")
-        tk.Frame(nav, bg=GRID, height=1).pack(side="bottom", fill="x", pady=8, padx=12)
+            bdg.pack(fill="x", pady=2)
 
         content = tk.Frame(self, bg=BG)
         content.grid(row=0, column=1, sticky="nsew")
-        self.tab_sessions = SessionsTab(content)
-        self.tab_sync = SyncTab(content)
-        self.tab_browse = BrowseTab(content)
+        self.content = content
+        content.rowconfigure(1, weight=1)
+        content.columnconfigure(0, weight=1)
+        self.page_header = tk.Frame(content, bg=BG, height=104)
+        self.page_header.grid(row=0, column=0, sticky="ew")
+        self.page_header.grid_propagate(False)
+        header_line = tk.Frame(self.page_header, bg=BG)
+        header_line.pack(fill="x", padx=24, pady=(18, 0))
+        self.page_title = tk.Label(header_line, text="", bg=BG, fg=FG,
+                                   font=(UI_FONT, 20, "bold"))
+        self.page_title.pack(side="left")
+        self.machine_badge = tk.Label(header_line, text="LOCAL WORKSPACE", bg=CARD, fg=MUT,
+                                      font=(UI_FONT, 8, "bold"), padx=10, pady=5)
+        self.machine_badge.pack(side="right", pady=3)
+        self.page_subtitle = tk.Label(self.page_header, text="", bg=BG, fg=MUT,
+                                      font=(UI_FONT, 9))
+        self.page_subtitle.pack(anchor="w", padx=25, pady=(2, 0))
+        tk.Frame(content, bg=GRID, height=1).grid(row=0, column=0, sticky="sew")
+        page_host = tk.Frame(content, bg=BG)
+        page_host.grid(row=1, column=0, sticky="nsew")
+        self.tab_sessions = SessionsTab(page_host)
+        self.tab_sync = SyncTab(page_host)
+        self.tab_browse = BrowseTab(page_host)
         self.pages = {"sessions": self.tab_sessions, "sync": self.tab_sync,
                       "browse": self.tab_browse}
+        self.page_meta = {
+            "sessions": ("会话管理", "跨目录查看、进入和维护所有 opencode 历史会话"),
+            "sync": ("共享同步", "查看 Syncthing 状态，并安全地在多台电脑之间切换"),
+            "browse": ("目录浏览", "浏览共享工作目录，快速定位冲突和同步临时文件"),
+        }
         self._cur = None
         self._wrappers = (self.tab_sync.info, self.tab_browse.hint, self.tab_sessions.status)
         self.bind("<Configure>", self._on_resize, add="+")
@@ -1179,8 +1232,11 @@ class App(_AppBase):
     def show(self, key):
         if self._cur:
             self.pages[self._cur].pack_forget()
-        self.pages[key].pack(fill="both", expand=True)
+        self.pages[key].pack(fill="both", expand=True, padx=16, pady=(4, 16))
         self._cur = key
+        title, subtitle = self.page_meta[key]
+        self.page_title.config(text=title)
+        self.page_subtitle.config(text=subtitle)
         for k, lbl in self._navlbls.items():
             if k == key:
                 lbl.config(bg=_shift(SIDEBAR, 18), fg=FG, font=(UI_FONT, 10, "bold"))
@@ -1234,7 +1290,7 @@ class App(_AppBase):
 
     def _on_resize(self, e):
         if e.widget is self:
-            wl = max(320, e.width - 480)
+            wl = max(320, self.content.winfo_width() - 40)
             for wdg in self._wrappers:
                 try:
                     wdg.configure(wraplength=wl)
