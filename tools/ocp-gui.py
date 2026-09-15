@@ -336,27 +336,55 @@ def setup_style(app):
     return style
 
 
-# 对话框/控件别名: 有 ttkbootstrap 用 bootstyle 语义色, 否则退回普通样式
+# 统一对话框: 用标准 tkinter.messagebox, 返回真正的 bool, 不受语言包影响;
+# 挂到主窗口为父级并临时置顶, 保证弹出在最前(修复"点删除没反应")
+def _mbox_parent():
+    try:
+        if app_ref is not None:
+            app_ref.lift()
+            app_ref.attributes("-topmost", True)
+    except Exception:
+        pass
+    return app_ref
+
+
+def _mbox_clear_topmost():
+    try:
+        if app_ref is not None:
+            app_ref.attributes("-topmost", False)
+    except Exception:
+        pass
+
+
+class Msg:
+    @staticmethod
+    def info(t, m):
+        p = _mbox_parent()
+        messagebox.showinfo(t, m, parent=p) if p else messagebox.showinfo(t, m)
+        _mbox_clear_topmost()
+
+    @staticmethod
+    def warning(t, m):
+        p = _mbox_parent()
+        messagebox.showwarning(t, m, parent=p) if p else messagebox.showwarning(t, m)
+        _mbox_clear_topmost()
+
+    @staticmethod
+    def error(t, m):
+        p = _mbox_parent()
+        messagebox.showerror(t, m, parent=p) if p else messagebox.showerror(t, m)
+        _mbox_clear_topmost()
+
+    @staticmethod
+    def askyesno(t, m):
+        p = _mbox_parent()
+        r = messagebox.askyesno(t, m, parent=p) if p else messagebox.askyesno(t, m)
+        _mbox_clear_topmost()
+        return bool(r)
+
+
+# 控件别名: 有 ttkbootstrap 用 bootstyle 语义色, 否则退回普通样式
 if HAS_TB:
-    from ttkbootstrap.dialogs import Messagebox as _MB
-
-    class Msg:
-        @staticmethod
-        def info(t, m):
-            _MB.show_info(m, t)
-
-        @staticmethod
-        def warning(t, m):
-            _MB.show_warning(m, t)
-
-        @staticmethod
-        def error(t, m):
-            _MB.show_error(m, t)
-
-        @staticmethod
-        def askyesno(t, m):
-            return _MB.yesno(m, t) == "Yes"
-
     L = tb.Label
     Fr = tb.Frame
     Ent = tb.Entry
@@ -366,23 +394,6 @@ if HAS_TB:
         kw = {"bootstyle": kind} if kind else {}
         return tb.Button(parent, text=text, command=cmd, **kw)
 else:
-
-    class Msg:
-        @staticmethod
-        def info(t, m):
-            messagebox.showinfo(t, m)
-
-        @staticmethod
-        def warning(t, m):
-            messagebox.showwarning(t, m)
-
-        @staticmethod
-        def error(t, m):
-            messagebox.showerror(t, m)
-
-        @staticmethod
-        def askyesno(t, m):
-            return messagebox.askyesno(t, m)
 
     L = ttk.Label
     Fr = ttk.Frame
