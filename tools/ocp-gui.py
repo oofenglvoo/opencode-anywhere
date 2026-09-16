@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
@@ -150,6 +151,99 @@ def _normalize_url(url):
     return u
 
 
+SYNC_ERR = {"last": ""}
+
+
+def _err_remember(msg):
+    """记住最近一次同步失败原因, 供"未就绪"之类的提示带上具体理由."""
+    SYNC_ERR["last"] = (msg or "").strip()
+
+
+def sync_last_error():
+    return SYNC_ERR["last"]
+
+
+def git_hint(msg):
+    """把 git 的常见报错翻成可执行的中文提示(认不出来就返回空串)."""
+    low = (msg or "").lower()
+    if "write access to repository not granted" in low or "403" in low:
+        return ("PAT 未授权该仓库(403). 细粒度 token: Repository access 勾上这个仓库, "
+                "Permissions → Contents 设为 Read and write; classic token: 需要 repo 范围")
+    if "401" in low or "bad credentials" in low or "authentication failed" in low:
+        return "PAT 无效或已过期(401), 请重新生成后粘贴"
+    if "repository not found" in low or "404" in low:
+        return "仓库地址不对, 或 PAT 无权访问该仓库"
+    if "not an empty directory" in low or "already exists and is not an empty" in low:
+        return f"同步工作区不是空目录, 请先删除 {SYNC_WORKDIR} 再重试"
+    if ("could not resolve host" in low or "failed to connect" in low
+            or "timed out" in low or "connection reset" in low):
+        return "网络不通或代理问题, 确认能访问 github.com"
+    if "terminal prompts disabled" in low or "could not read username" in low:
+        return "git 需要交互式凭证但已禁用; 请改用 HTTPS+PAT, 或确认本机 SSH 凭据可用"
+    return ""
+
+
+def _with_hint(e):
+    msg = str(e).strip()
+    hint = git_hint(msg)
+    return f"{msg}\n\n提示: {hint}" if hint else msg
+
+
+def _gh_api(path, token):
+    """GitHub API: 返回 (状态码, 解析后的 JSON 或错误文本); 网络异常返回 (None, 原因)."""
+    req = urllib.request.Request("https://api.github.com" + path,
+                                 headers={"Accept": "application/vnd.github+json",
+                                          "User-Agent": "opencode-anywhere"})
+    tok = (token or "").strip()
+    if tok:
+        req.add_header("Authorization", "Bearer " + tok)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = str(e)
+        return e.code, body
+    except Exception as e:
+        return None, str(e)
+
+
+def _visible_repos(token, limit=8):
+    code, body = _gh_api("/user/repos?per_page=100&affiliation="
+                         "owner,collaborator,organization_member", token)
+    if code != 200 or not isinstance(body, list):
+        return []
+    return [r.get("full_name") for r in body if r.get("full_name")][:limit]
+
+
+def check_repo_access(url, token):
+    """克隆前用 API 预检: 返回 None 表示检查通过(或无法判断), 否则返回中文原因."""
+    slug = _github_slug(url)
+    if not slug:
+        return None
+    owner, repo = slug
+    code, body = _gh_api(f"/repos/{owner}/{repo}", token)
+    if code == 200:
+        if isinstance(body, dict) and not (body.get("permissions") or {}).get("push"):
+            return (f"PAT 对 {owner}/{repo} 只有只读权限, 无法上传.\n"
+                    "请把 token 的 Repository access 加上该仓库, "
+                    "Permissions → Contents 设为 Read and write")
+        return None
+    if code == 401:
+        return "PAT 无效或已过期(401), 请重新生成后粘贴"
+    if code == 404:
+        names = _visible_repos(token)
+        extra = ("\n该 PAT 目前能看到: " + ", ".join(names)) if names else ""
+        return (f"PAT 访问不到 {owner}/{repo} (404).\n"
+                f"常见原因: token 的 Repository access 没勾选这个仓库, 地址写错, 或仓库不存在."
+                f"{extra}\n"
+                "细粒度 token: Repository access 勾上该仓库 + Contents: Read and write; "
+                "classic token: 需要 repo 范围")
+    return None
+
+
 def repo_ready():
     return os.path.isdir(os.path.join(SYNC_WORKDIR, ".git"))
 
@@ -160,12 +254,26 @@ def repo_prepare(url, token):
     if not url:
         raise RuntimeError("未配置私库地址")
     if not repo_ready():
+        # 有 PAT 且是 HTTPS 时先做 API 预检, 让"权限不足"在克隆前就以中文说清楚
+        if url.lower().startswith("https://") and (token or "").strip():
+            tip = check_repo_access(url, token)
+            if tip:
+                _err_remember(tip)
+                raise RuntimeError(tip)
         if os.path.isdir(SYNC_WORKDIR):
             shutil.rmtree(SYNC_WORKDIR, ignore_errors=True)
         os.makedirs(SYNC_WORKDIR, exist_ok=True)
-        _git(["clone", _auth_url(url, token), "."])
+        try:
+            _git(["clone", _auth_url(url, token), "."])
+        except Exception as e:
+            # 失败不留空工作区: 否则后续只会看到含糊的"未就绪"
+            shutil.rmtree(SYNC_WORKDIR, ignore_errors=True)
+            msg = _with_hint(e)
+            _err_remember(msg)
+            raise RuntimeError(msg)
     _git(["config", "user.name", "opencode-sync"])
     _git(["config", "user.email", "opencode-sync@local"])
+    _err_remember("")
     return url
 
 
@@ -384,19 +492,27 @@ def sync_push_sessions(host, root_ids):
     manifest = export_bundle(root_ids, dest)
     if manifest["zsize"] > DB_LIMIT_MB << 20:
         os.remove(dest)
-        raise RuntimeError(f"会话包压缩后约 {human_size(manifest['zsize'])}, 超过 "
-                           f"{DB_LIMIT_MB}MB (GitHub 单文件硬限 100MB).\n"
-                           "请减少所选会话(尤其是超大的旧会话), 或先删除部分旧会话再上传.")
+        msg = (f"会话包压缩后约 {human_size(manifest['zsize'])}, 超过 "
+               f"{DB_LIMIT_MB}MB (GitHub 单文件硬限 100MB).\n"
+               "请减少所选会话(尤其是超大的旧会话), 或先删除部分旧会话再上传.")
+        _err_remember(msg)
+        raise RuntimeError(msg)
     _git(["add", "-A"])
     _git(["commit", "-m", f"sessions {safe_host} {stamp} "
                           f"({len(manifest['sessions'])} sessions)"])
     auth = _auth_url(url, cfg.get("token"))
     try:
-        _git(["push", auth, branch])
-    except RuntimeError:
-        _git(["fetch", "origin"])
-        _git(["rebase", "origin/" + branch], check=False)
-        _git(["push", auth, branch])
+        try:
+            _git(["push", auth, branch])
+        except RuntimeError:
+            _git(["fetch", "origin"])
+            _git(["rebase", "origin/" + branch], check=False)
+            _git(["push", auth, branch])
+    except RuntimeError as e:
+        msg = _with_hint(e)
+        _err_remember(msg)
+        raise RuntimeError(msg)
+    _err_remember("")
     write_marker(host)
     return manifest
 
@@ -1214,7 +1330,10 @@ class SessionsTab(Fr):
             Msg.warning("未配置私库", "请先到[会话同步]页填写私库地址和 PAT, 点[保存并准备仓库].")
             return
         if not repo_ready():
-            Msg.warning("未就绪", "同步工作区尚未就绪, 请先到[会话同步]页点[保存并准备仓库].")
+            last = sync_last_error()
+            Msg.warning("同步工作区未就绪",
+                        "请先到[会话同步]页点[保存并准备仓库].\n\n"
+                        + (f"上次失败原因:\n{last}" if last else f"工作区: {SYNC_WORKDIR}"))
             return
         if not shutil.which("git"):
             Msg.error("缺少 Git", "未找到 git 命令, 请先安装 Git.")
@@ -1331,6 +1450,16 @@ class SyncTab(Fr):
         rows.append(("整库体积状态",
                      "超限, 无法整库上传" if limit else ("偏大, 注意清理" if warn else "正常"),
                      f"预警线 {DB_WARN_MB}MB, 上限 {DB_LIMIT_MB}MB (按压缩后估算, GitHub 单文件硬限 100MB)"))
+        url_cfg = (self.cfg.get("repo_url") or "").strip()
+        if not url_cfg:
+            rows.append(("同步工作区", "未配置", "先在上面填私库地址和 PAT, 再点[保存并准备仓库]"))
+        elif repo_ready():
+            rows.append(("同步工作区", "就绪", SYNC_WORKDIR))
+        else:
+            last = sync_last_error()
+            rows.append(("同步工作区", "未准备",
+                         (last.replace("\n", "  ") if last else
+                          f"点[保存并准备仓库]完成克隆 ({SYNC_WORKDIR})")))
         r = self._remote
         if r:
             mb = r.get("repo_mb")
@@ -1361,19 +1490,27 @@ class SyncTab(Fr):
         self.url_ent.insert(0, url)
         self.cfg = {"repo_url": url, "token": self.tok_ent.get().strip()}
         save_sync_cfg(self.cfg)
-        self.progress.config(text="正在克隆/检查仓库...")
+        self.progress.config(text="正在检查仓库与权限...")
         run_bg(lambda: repo_prepare(url, self.cfg.get("token")),
-               on_ok=lambda _: (self.progress.config(text="仓库就绪"),
+               on_ok=lambda _: (self.progress.config(text="仓库就绪"), self.refresh(),
                                 Msg.info("仓库就绪", f"同步工作区已就绪:\n{url}\n\n"
                                                      "可以到[会话管理]勾选会话上传, 或点[刷新远端会话包]查看远端.")),
-               on_err=lambda e: (self.progress.config(text=""), Msg.error("准备失败", str(e))))
+               on_err=self._prepare_failed)
+
+    def _prepare_failed(self, e):
+        self.progress.config(text="准备失败, 详见下方[同步工作区]")
+        self.refresh()
+        Msg.error("准备失败", str(e))
 
     def _need_ready(self):
         if not (self.cfg.get("repo_url") or "").strip():
             Msg.warning("缺少配置", "请先填写私库地址并点[保存并准备仓库].")
             return False
         if not repo_ready():
-            Msg.warning("未就绪", "同步工作区尚未就绪, 请先点[保存并准备仓库].")
+            last = sync_last_error()
+            Msg.warning("同步工作区未就绪",
+                        "请先点[保存并准备仓库]完成克隆.\n\n"
+                        + (f"上次失败原因:\n{last}" if last else f"工作区: {SYNC_WORKDIR}"))
             return False
         return True
 
@@ -1990,6 +2127,23 @@ def selftest():
     for p in (src_db, dst_db, pkg):
         os.remove(p)
     print("   会话包导出/并入 OK")
+    print("== 7. 私库地址规范化与错误提示 ==")
+    assert _normalize_url("me/repo") == "https://github.com/me/repo.git"
+    assert _normalize_url("github.com/me/repo") == "https://github.com/me/repo.git"
+    assert _normalize_url("https://github.com/me/repo.git") == "https://github.com/me/repo.git"
+    assert _normalize_url("git@github.com:me/repo.git") == "git@github.com:me/repo.git"
+    assert _normalize_url("") == ""
+    assert _github_slug("https://github.com/me/repo.git") == ("me", "repo")
+    assert "未授权" in git_hint("remote: Write access to repository not granted.")
+    assert "仓库地址不对" in git_hint("remote: Repository not found.")
+    assert "PAT 无效" in git_hint("fatal: Authentication failed for 'https://...'")
+    assert "不是空目录" in git_hint("fatal: destination path '.' already exists and is not an empty directory.")
+    assert "网络" in git_hint("fatal: unable to access 'https://github.com/x': Could not resolve host: github.com")
+    assert git_hint("") == "" and git_hint("some random failure") == ""
+    _err_remember("x")
+    assert sync_last_error() == "x"
+    _err_remember("")
+    print("   地址规范化/错误提示 OK")
     print("ALL PASS")
 
 
