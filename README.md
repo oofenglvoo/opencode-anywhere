@@ -1,6 +1,6 @@
 # opencode-anywhere
 
-集中管理 opencode 历史会话，并通过 Syncthing 在多台 Windows 电脑之间共享会话数据、配置和工作目录。
+集中管理 opencode 历史会话，并把**勾选的会话**导出成独立会话包，经 GitHub 私库（HTTPS）在多台 Windows 电脑之间增量同步。项目代码请照常用 Git 自行同步。
 
 ## 功能
 
@@ -8,27 +8,39 @@
 - 按标题、目录和会话状态搜索
 - 快速进入会话，在对应工作目录启动 `opencode --session <id>`
 - 删除会话及其关联消息、数据块、事件和子会话
-- 查看 Syncthing 共享目录状态和待同步大小
-- 手动触发同步、暂停/恢复共享目录
-- 编辑 Syncthing 忽略规则
-- 浏览共享目录、打开文件和在资源管理器中定位
-- 在多台 Windows 电脑之间安全切换活跃工作机
+- 勾选任意会话导出成独立会话包上传到 GitHub 私库，对端按包并入（不影响其它会话）
+- 上传前显示会话包体积与压缩后估算，超限会拒绝
+- 浏览工作目录、打开文件和在资源管理器中定位
 
 ## 使用步骤
 
 ### 第 1 步：A 机（第一台电脑）准备
 
-1. 按[环境要求](#环境要求)安装 Python、opencode、Syncthing 2.x、Git 和 `ttkbootstrap`
-2. 启动 Syncthing，确认托盘图标在运行
-3. 启动 GUI：
+1. 按[环境要求](#环境要求)安装 Python、opencode、Git 和 `ttkbootstrap`
+2. 在 GitHub 建一个**私有**空仓库（例如 `opencode-sync`）
+3. 建一个 fine-grained PAT，只授权这一个仓库的 `Contents: Read and write`
+   （GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens）
+4. 启动 GUI：
 
    ```powershell
    tools\ocp-gui.cmd
    ```
 
-4. 此时 A 机已可正常使用：会话管理、目录浏览等功能立即生效
+5. 进入「会话同步」页，填入私库地址和 PAT，点 **保存并准备仓库**
 
-### 第 2 步：B 机（第二台电脑）初始化
+   地址默认按 **HTTPS** 方式访问，以下写法都可以，会自动补全为 `https://github.com/...`：
+
+   ```text
+   you/opencode-sync
+   github.com/you/opencode-sync
+   https://github.com/you/opencode-sync.git
+   ```
+
+   （如需走 SSH，直接填 `git@github.com:you/opencode-sync.git`，此时 PAT 可留空。）
+
+6. 填入后 A 机即可正常使用：会话管理、目录浏览等功能立即生效
+
+### 第 2 步：B 机（第二台电脑）环境安装
 
 1. 把整个 `tools` 文件夹复制到 B 机任意目录
 2. 在 B 机以**管理员**身份打开 PowerShell，进入 `tools` 目录后执行：
@@ -37,58 +49,43 @@
    powershell -NoProfile -ExecutionPolicy Bypass -File .\install-remote.ps1
    ```
 
-   脚本会自动安装缺失的 Git/Node.js/Python/Syncthing、安装 `opencode-ai` 和 `ttkbootstrap`、初始化 Syncthing、创建三个同步目录、加桌面快捷方式并把 `tools` 加入 PATH
+   脚本只负责**装环境**：安装缺失的 Git/Node.js/Python、安装 `opencode-ai` 和 `ttkbootstrap`、加桌面快捷方式、把 `tools` 加入 PATH。会话同步全部在 GUI 里完成
 
-   > 运行时脚本会要求粘贴 **A 机 Device ID**（可先在 A 机运行 `oc-status` 记下）。出于安全考虑脚本不再硬编码设备 ID，请勿把任何机器的 Device ID 提交到公开仓库
-3. **记下脚本最后输出的 B 机 Device ID**
-4. 回到 A 机，执行配对（把 B 机加入同步设备）：
+3. 首次在 B 机使用 opencode 时，请自行登录 opencode（会话包只含会话数据，不含登录凭据）
 
-   ```powershell
-   oc-pair <B机DeviceID>
-   ```
+### 第 3 步：B 机配置同步
 
-5. 若 B 机此前未自动完成配对确认，在 B 机 Syncthing Web 管理页（`https://127.0.0.1:8384`）接受 A 机的共享请求
+1. 打开 B 机 GUI（`ocp-gui`），进入「会话同步」页
+2. 填入**同一个**私库地址和 PAT，点 **保存并准备仓库**
 
-### 第 3 步：等待首次同步完成
+### 第 4 步：日常同步流程
 
-- 首次同步会传输全部会话数据库、配置和工作目录文件，视数据量可能需要几分钟到几小时
-- 两台电脑都可以用 `oc-status` 或 GUI「共享同步」页查看各目录状态，直到三个目录均显示 `idle` 且待传为 0
-- **注意**：两台电脑的项目路径必须一致（例如都是 `D:\PythonProjects\claudeproject`），否则会话无法在 B 机续接
+方向 A（A 机 → B 机）：
 
-### 第 4 步：日常换机流程
+1. **A 机上传**：到「会话管理」勾选要同步的会话（可多选，支持搜索/筛选后全选），点 **上传所选会话**
 
-每次在两台电脑之间切换工作时，严格按以下顺序：
+   确认框会显示会话数、子会话数、本地数据量。上传时自动执行：导出会话包（含子会话、消息、数据块、事件）→ 压缩后体积守门 → commit → push。**可以随时上传，不必退出 opencode**
 
-1. **旧机收尾**：退出旧电脑上全部 opencode 窗口，然后执行：
+   会话包按 `bundles/<时间>-<主机名>.db` 命名，每次上传生成一个新包，因此可以多次增量上传
 
-   ```powershell
-   oc-out
-   ```
+2. **B 机并入**：在「会话同步」页点 **刷新远端会话包**，列表会显示每个包的来源机器、上传时间、会话数、包大小、本机缺少的会话数；选中要并入的包（可多选），点 **下载并并入所选**
 
-   它会合并数据库 WAL、标记本机已收工、等待 Syncthing 传完（GUI 中对应「共享同步」页的「本机收尾」按钮）。之后旧机可以关机
+   并入时**只覆盖同 ID 的会话**，其它会话和本地独有会话完全不受影响。并入前请先退出本机全部 opencode 窗口
 
-2. **新机接管**：在新电脑上执行：
+3. **继续工作**：到「会话管理」按 F5 刷新，选中会话点「进入会话」即可续接
 
-   ```powershell
-   oc-in
-   ```
-
-   它会等待 Syncthing 拉取完成、确认旧机已退出、把本机标记为活跃机器
-
-3. **继续工作**：
-
-   ```powershell
-   ocp-gui
-   ```
-
-   在会话管理页选中历史会话点「进入会话」，即可在原工作目录续接之前的对话
-
-> 核心原则：**同一时间只在一台电脑上使用 opencode**。两台同时写会话数据库会产生冲突文件。
+> 不再要求"同一时间只在一台电脑活跃"：同步是**按会话合并**，不是整库覆盖。
+> 但同一个会话如果在两台电脑上都有新消息，后并入的一方会覆盖先前的版本。
+>
+> **注意**：两台电脑的项目路径最好一致（例如都是 `D:\PythonProjects\claudeproject`），否则会话在另一台续接时要先到对应目录把项目代码 clone/pull 回来。
 
 ### 第 5 步（可选）：日常维护
 
-- `oc-status`：随时查看 Syncthing 连接设备和各目录待传量
-- GUI「共享同步」页：手动扫描、暂停/恢复目录、编辑 `.stignore`
+- **刷新远端会话包**：查看远端有哪些会话包、是否已有同名会话
+- **刷新统计**：本地库体积、WAL、压缩后估算、会话/消息/数据块数量
+- **压缩数据库(VACUUM)**：删除会话后回收空闲页；需先退出全部 opencode，约需两倍磁盘空间
+- 体积守门：单个会话包压缩后超过 50MB 预警、超过 95MB 拒绝上传（GitHub 单文件硬限 100MB）。超大旧会话请先在「会话管理」删除再同步
+- 会话管理页「大小」列显示每个会话的占用（含子会话的 message/part/event 数据），可据此找出大会话
 - 修改 `tools\ocp-gui.py` 后，运行 `tools\build-exe.ps1` 重新打包更新 EXE
 
 ## 目录结构
@@ -103,23 +100,17 @@ opencode会话和文件同步/
    ├─ ocp-gui.cmd         # GUI 启动器
    ├─ ocp.py              # 终端会话选择器
    ├─ ocp.cmd
-   ├─ oc-sync.ps1         # 同步切换逻辑
-   ├─ oc-out.cmd
-   ├─ oc-in.cmd
-   ├─ oc-status.cmd
-   ├─ oc-pair.ps1         # A 机配对 B 机
-   ├─ oc-pair.cmd
-   └─ install-remote.ps1  # B 机一键初始化
+   └─ install-remote.ps1  # B 机环境安装
 ```
 
 ## 环境要求
 
 - Windows 10/11
-- Python 3.10 或更高版本
+- Python 3.10 或更高版本（仅开发机需要；打包后的 EXE 自带运行时）
 - opencode
-- Syncthing 2.x
-- Git（opencode 的部分撤销/恢复能力依赖 Git）
+- Git（会话同步与 opencode 的部分撤销/恢复能力都依赖 Git）
 - Python 包：`ttkbootstrap`
+- 一个 GitHub 私库（同步会话包）
 
 安装 Python 依赖：
 
@@ -160,7 +151,7 @@ ocp-gui
 - 页面右上角有 **☀ 浅色 / ☾ 深色** 切换按钮，点击后保存偏好并重启，全部控件（含原生 Tk、ttk、Treeview、侧栏、菜单）一起换色。
 - 主题偏好保存到 `%USERPROFILE%\.local\share\opencode\ocp-gui-theme.json`。
 - 程序退出/移动/缩放后，窗口尺寸与位置会记录到 `%USERPROFILE%\.local\share\opencode\ocp-gui-window.json`，下次启动自动恢复。
-- 启动后按各页面工具栏的实际所需宽度做一次自适应：若恢复的窗口过小，会自动扩大到能完整显示所有按钮（含“删除会话”和同步页“待传/暂停”列），并限制在屏幕范围内。
+- 启动后按各页面工具栏的实际所需宽度做一次自适应：若恢复的窗口过小，会自动扩大到能完整显示所有按钮，并限制在屏幕范围内。
 
 ## 打包为独立 EXE
 
@@ -174,7 +165,7 @@ python -m pip install pyinstaller
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-exe.ps1
 ```
 
-产物：`dist\opencode-anywhere.exe`（约 13MB，已内嵌 `tools\app.ico`）。`dist/`、`build/`、`*.spec` 已在 `.gitignore` 中忽略，不入库。修改 `tools\ocp-gui.py` 后重新运行该脚本即可更新 exe。
+产物：`dist\opencode-anywhere.exe`（约 20MB，已内嵌 `tools\app.ico`）。`dist/`、`build/`、`*.spec` 已在 `.gitignore` 中忽略，不入库。修改 `tools\ocp-gui.py` 后重新运行该脚本即可更新 exe。
 
 GUI 包含三个页面：
 
@@ -183,26 +174,28 @@ GUI 包含三个页面：
 - **搜索**：匹配会话标题和工作目录
 - **目录**：只显示指定工作目录的会话
 - **状态**：筛选 `空闲`、`近期活跃` 或 `运行中`
+- **大小**：每个会话的占用估算（含子会话的 message/part/event 数据），底部状态栏显示会话合计
 - **进入会话**：在原始工作目录启动新的 opencode 控制台
 - **打开目录**：在资源管理器中打开会话工作目录
+- **上传所选会话**：把勾选的会话（含子会话）导出成会话包并推送到私库
 - **删除会话**：删除前显示关联数据量并要求二次确认
 
-### 共享同步
+### 会话同步
 
-- 查看 Syncthing 是否运行
-- 查看每个共享目录的同步状态和待传大小
-- 立即扫描某个共享目录
-- 暂停或恢复某个共享目录
-- 编辑该目录的 `.stignore` 规则
-- 执行换机前的收尾和新机接管流程
+- 配置 GitHub 私库地址（默认 HTTPS，填 `owner/repo` 会自动补全）+ PAT，一键 clone 到本地同步工作区
+- 本地库体积统计：库/WAL 大小、压缩后估算、会话/消息/数据块数量
+- **刷新远端会话包**：拉取远端列表（上传时间、来源机器、会话数、包大小、本机缺少数）
+- **下载并并入所选**：把选中会话包里的会话并入本地库；只覆盖同 ID 会话，其它会话不受影响
+- **压缩数据库(VACUUM)**：删除会话后回收空闲页，缩小库文件
+- 体积守门：单个会话包按压缩后估算，>50MB 预警，>95MB 拒绝上传
 
 ### 目录浏览
 
-- 浏览三个共享目录的文件内容
+- 浏览工作目录的文件内容
 - 双击进入目录或打开文件
 - 右键在资源管理器中定位
 - 复制完整路径
-- 橙色表示 Syncthing 冲突文件，红色表示传输临时文件
+- 橙色表示历史同步冲突文件，红色表示同步临时残留
 
 ## 会话删除判定
 
@@ -246,50 +239,43 @@ GUI 包含三个页面：
 
 ## 多机共享方案
 
-本项目使用 Syncthing，而不是直接让两台电脑同时打开同一个 SQLite 数据库。
+同步不再整库覆盖，而是**按会话导出成独立会话包**，通过 GitHub 私库中转。
+
+### 工作方式
+
+- 上传：勾选会话 → 导出会话包 → 压缩后体积守门 → `commit`/`push` 到私库 `bundles/` 目录
+- 会话包是一个独立的 SQLite 文件，只包含所选会话（连同子会话）及其关联数据：
+  `session`（含父会话）、`message`、`part`、`todo`、`session_share`、`session_input`、
+  `session_message`、`session_context_epoch`、`event`、`event_sequence`，
+  以及这些会话依赖的 `project` / `project_directory` / `workspace` 元数据
+- 包内附 `ocp_manifest` 表，记录来源主机、上传时间和会话清单（标题/目录/消息数/数据量）
+- 下载：拉取远端 → 列出会话包 → 选中后**并入本地库**。并入时先删除本地同 ID 会话的关联行，再以包内数据覆盖，整个过程在同一事务内完成，失败自动回滚；本地其它会话不受影响
+- 本地同步工作区：`%LOCALAPPDATA%\opencode-git-sync`（私库的 clone）
+- **不包含**：登录凭据（`account`/`credential` 等）、项目代码、磁盘上的 `tool-output/` 附件。B 机需要自行登录 opencode，项目代码请用 Git 同步
+
+### 安全须知
+
+- **务必使用私有仓库**：会话内容（提示词、代码片段、工具输出）会明文存储在 GitHub 私库中
+- 建议使用 fine-grained PAT 并只授权这一个仓库；PAT 只保存在本机 `%USERPROFILE%\.local\share\opencode\ocp-sync.json`
+- 地址默认按 HTTPS 补全；若填 `git@...` 则走本机 git 凭据（SSH）
+- 仓库会随每次上传保留历史提交，体积持续增长；可在 GitHub 上定期清理历史或压缩仓库
 
 ### 推荐约束
 
-- 同一时间只在一台电脑上使用 opencode
-- 换机前必须先退出旧电脑上的全部 opencode
-- 旧电脑执行 `oc-out` 或 GUI 中的“本机收尾”
-- 新电脑执行 `oc-in` 或 GUI 中的“接管本机”
-- 两台电脑的项目路径保持一致，例如都使用：
+- 同一个会话不要在两端同时继续对话，后并入的一方会覆盖先前的版本
+- 并入前先退出本机全部 opencode 窗口
+- 两台电脑的项目路径最好保持一致，例如都使用：
 
 ```text
 D:\PythonProjects\claudeproject
 ```
 
-### 同步目录
+## Git 项目与会话同步
 
-| 名称 | 默认路径 | 内容 |
-|---|---|---|
-| `opencode-data` | `%USERPROFILE%\.local\share\opencode` | 会话数据库、快照和计划 |
-| `opencode-config` | `%USERPROFILE%\.config\opencode` | opencode 配置、插件和 skills |
-| `claudeproject` | `D:\PythonProjects\claudeproject` | 非 Git 工作目录和本项目 |
+建议：
 
-会话数据库中可能包含模型登录凭据。只应把 Syncthing 设备共享给可信电脑，并尽量使用局域网直连或可信的自建 relay。
-
-### 命令行切换流程
-
-旧电脑：
-
-```powershell
-oc-out
-```
-
-新电脑：
-
-```powershell
-oc-in
-ocp
-```
-
-查看同步状态：
-
-```powershell
-oc-status
-```
+- 项目代码不进会话同步流程：有远端仓库的 Git 项目在 B 机使用 `git clone`，日常 `git pull/push`
+- 会话同步只用 GUI 的「上传所选会话 / 下载并并入所选」，不要手动往同步工作区提交其他文件
 
 ## B 机初始化
 
@@ -302,39 +288,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-remote.ps1
 
 脚本会尝试完成以下工作：
 
-- 安装缺失的 Git、Node.js、Python 和 Syncthing
-- 安装 `opencode-ai`
-- 安装 `ttkbootstrap`
-- 初始化并启动 Syncthing
-- 创建三个同步目录
-- 添加 A 机设备
+- 安装缺失的 Git、Node.js 和 Python
+- 安装 `opencode-ai` 和 `ttkbootstrap`
 - 创建 B 机桌面快捷方式
 - 将工具目录加入 PATH
 
-3. 记下脚本输出的 B 机 Device ID。
-4. 回到 A 机执行：
-
-```powershell
-oc-pair <B机DeviceID>
-```
-
-5. 等待 Syncthing 完成首次同步。
-6. B 机执行：
-
-```powershell
-oc-in
-ocp-gui
-```
-
-## Git 项目与 Syncthing 项目
-
-建议：
-
-- 有远端仓库的 Git 项目：在 B 机使用 `git clone`，日常使用 `git pull/push`
-- 没有远端仓库、需要随目录同步的项目：放在 `claudeproject` 的 Syncthing 同步范围内
-- 不要让同一个 Git 项目同时被 Git 操作和另一台电脑的 Syncthing 写入
-
-当前 `claudeproject/.stignore` 已将有 Git 远端的项目排除，只同步没有远端的 `okx预测市场` 等目录。
+3. 打开 B 机 GUI「会话同步」页，填入与 A 机相同的私库地址和 PAT，点 **保存并准备仓库**。
+4. 点 **刷新远端会话包**，选中要同步的包，点 **下载并并入所选**，然后到「会话管理」按 F5 查看。
 
 ## 自检与测试
 
@@ -348,10 +308,10 @@ python tools\ocp-gui.py selftest
 
 - 会话数据库读取
 - SQLite schema 副本中的级联删除
-- Syncthing REST 连接
-- 忽略规则读取
+- 会话库体积统计与同步配置状态
 - 活跃会话检测
 - opencode 可执行文件检测
+- 会话包导出/并入往返（在真实 schema 的临时库上验证：子会话随包导出、按包覆盖同名会话、重复并入幂等、本地独有会话保留）
 
 GUI 冒烟测试：
 
@@ -367,21 +327,28 @@ python tools\ocp-gui.py smoke
 
 ### 打开 GUI 后不断弹出 CMD
 
-当前版本已经给 WMI 和 `tasklist` 子进程增加 `CREATE_NO_WINDOW`。如果仍然弹出，确认启动的是项目目录下最新的 `ocp-gui.cmd`，而不是旧的 `%USERPROFILE%\bin\ocp-gui.cmd`。
+当前版本已经给 WMI、`tasklist` 和 git 子进程增加 `CREATE_NO_WINDOW`。如果仍然弹出，确认启动的是项目目录下最新的 `ocp-gui.cmd`，而不是旧的 `%USERPROFILE%\bin\ocp-gui.cmd`。
 
 ### B 机看不到历史会话
 
 依次检查：
 
-1. Syncthing 三个目录是否已完成同步
-2. B 机的 opencode 是否已安装
-3. B 机项目路径是否仍为 `D:\PythonProjects\claudeproject`
-4. 是否先执行了 `oc-in`
+1. B 机是否已在「会话同步」页配置同一私库并点过 **刷新远端会话包**，再选中包点 **下载并并入所选**
+2. 并入完成后到「会话管理」按 F5 刷新
+3. B 机的 opencode 是否已安装，并且已登录（会话包不含登录凭据）
+4. 会话目录不存在时，需要先在 B 机把项目代码 clone/pull 到同一路径
 5. 是否启动的是项目 `tools` 目录中的 GUI
 
-### 同步出现冲突
+### 上传失败
 
-立即关闭两台电脑上的 opencode，保留 Syncthing 生成的冲突文件，然后确认哪一份是最新内容。不要在两台电脑同时继续写入会话数据库。
+- 提示克隆/push 失败：检查网络、私库地址、PAT 权限（需要对该仓库 `Contents: Read and write`）
+- 提示会话包体积超限：单个包压缩后超过 95MB。到「会话管理」按「大小」列找出大会话，减少勾选范围，或删除过大的旧会话后再上传
+- 看不到远端会话包：确认上传后点过 **刷新远端会话包**；远端为空说明还没成功上传过
+
+### 并入后发现会话内容不是最新
+
+同一会话在两台电脑都有改动时，以**最后并入**的一方为准。核实后重新上传/并入需要的版本即可。
+并入前会先删除本地同 ID 会话再写入包内数据，因此不会产生重复会话；如仍需回退，可用 `%USERPROFILE%\.local\share\opencode\opencode.db.bak-<时间>` 之类的历史备份找回。
 
 ## 许可证
 

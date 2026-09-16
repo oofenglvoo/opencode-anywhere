@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """ocp-gui - opencode 会话与共享目录集中管理器 (Tkinter).
 
-Tab1 会话管理: 跨目录查看/搜索全部历史会话, 一键进入、定位、删除.
-Tab2 共享同步: Syncthing 目录状态/立即同步/暂停恢复/忽略规则编辑, 切换助手(oc-out/oc-in).
+Tab1 会话管理: 跨目录查看/搜索全部历史会话, 一键进入、定位、删除、上传所选会话.
+Tab2 会话同步: 勾选的会话导出成独立会话包, 经 GitHub 私库(HTTPS)在多台电脑间增量同步.
 Tab3 目录浏览: 浏览共享目录内容, 高亮同步冲突/临时文件.
 
 用法:
@@ -13,6 +13,7 @@ Tab3 目录浏览: 浏览共享目录内容, 高亮同步冲突/临时文件.
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -20,14 +21,12 @@ import sys
 import threading
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
+import zlib
 
 HOME = os.path.expanduser("~")
 DATA_DIR = os.path.join(HOME, ".local", "share", "opencode")
 DB = os.environ.get("OPENCODE_DB", os.path.join(DATA_DIR, "opencode.db"))
 MARKER = os.path.join(DATA_DIR, ".opencode-active-host")
-ST_CONFIG = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Syncthing", "config.xml")
-ST_TIMEOUT = 120
 CREATE_NEW_CONSOLE = 0x00000010
 CREATE_NO_WINDOW = 0x08000000
 
@@ -40,84 +39,416 @@ select s.id, s.title, s.directory, s.time_updated,
 """
 
 
-# ---------------- Syncthing REST ----------------
+# ---------------- GitHub 私库会话同步 ----------------
 
-def _q(s):
-    return urllib.parse.quote(s, safe="")
+_FROZEN_ENV_KEYS = ("_MEIPASS2", "TCL_LIBRARY", "TK_LIBRARY", "_PYI_APPLICATION_HOME_DIR",
+                    "_PYI_ARCHIVE_FILE", "_PYI_PARENT_PROCESS_LEVEL", "_PYI_SPLASH_IPC")
 
 
-class Syncthing:
-    def __init__(self):
-        self.base = None
-        self.key = None
-        self.err = None
-        if not os.path.isfile(ST_CONFIG):
-            self.err = "未找到 Syncthing 配置(未安装或未初始化)"
-            return
+def child_env():
+    """PyInstaller onefile 会把 _MEIPASS2/_PYI_*/TCL_LIBRARY 传给子进程. 若原样继承,
+    从 GUI 启动的 opencode 里再启动 GUI, 新进程会复用已被删除的 _MEI 解压目录,
+    随即以 "Can't find a usable init.tcl" 报错打不开窗口. 启动子进程前必须剥离."""
+    env = dict(os.environ)
+    for k in [k for k in env if k.startswith("_PYI_") or k in _FROZEN_ENV_KEYS]:
+        env.pop(k, None)
+    return env
+
+
+SYNC_CFG_FILE = os.path.join(DATA_DIR, "ocp-sync.json")
+SYNC_WORKDIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "opencode-git-sync")
+BUNDLE_DIR = "bundles"
+BUNDLE_EXT = ".db"
+MANIFEST_TABLE = "ocp_manifest"
+DB_WARN_MB, DB_LIMIT_MB = 50, 95
+BUNDLE_TABLES = ("project", "project_directory", "workspace", "session", "message", "part",
+                 "todo", "session_share", "session_input", "session_message",
+                 "session_context_epoch", "event_sequence", "event")
+_COPY_MODE = {"project": "ignore", "project_directory": "ignore", "workspace": "ignore",
+              "session": "replace", "message": "replace", "part": "replace", "todo": "replace",
+              "session_share": "replace", "session_input": "replace",
+              "session_message": "replace", "session_context_epoch": "replace",
+              "event_sequence": "replace", "event": "replace"}
+_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"}
+
+
+def load_sync_cfg():
+    try:
+        with open(SYNC_CFG_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sync_cfg(cfg):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SYNC_CFG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def db_stats():
+    """本地会话库体积统计."""
+    st = {"db": 0, "wal": 0, "sessions": 0, "messages": 0, "parts": 0, "zdb": 0}
+    if os.path.isfile(DB):
+        st["db"] = os.path.getsize(DB)
         try:
-            gui = ET.parse(ST_CONFIG).getroot().find("gui")
-            addr = gui.findtext("address") or "127.0.0.1:8384"
-            if not addr.startswith(("127.", "localhost")):
-                addr = "127.0.0.1" + addr[addr.rindex(":"):]
-            self.base = "http://" + addr
-            self.key = gui.findtext("apikey")
-        except Exception as e:
-            self.err = f"解析 config.xml 失败: {e}"
-
-    def req(self, path, method="GET", body=None, timeout=10):
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        r = urllib.request.Request(self.base + path, data=data, method=method,
-                                   headers={"X-API-Key": self.key,
-                                            "Content-Type": "application/json"})
-        with urllib.request.urlopen(r, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw.strip() else None
-
-    def alive(self):
-        if self.err:
-            return False
+            with open(DB, "rb") as f:
+                st["zdb"] = len(zlib.compress(f.read(), 6))
+        except OSError:
+            pass
+    if os.path.isfile(DB + "-wal"):
+        st["wal"] = os.path.getsize(DB + "-wal")
+    try:
+        con = db_ro()
         try:
-            self.req("/rest/system/status", timeout=3)
-            return True
-        except Exception:
-            return False
+            st["sessions"] = con.execute(
+                "select count(*) from session where parent_id is null").fetchone()[0]
+            st["messages"] = con.execute("select count(*) from message").fetchone()[0]
+            st["parts"] = con.execute("select count(*) from part").fetchone()[0]
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return st
 
-    def my_id(self):
-        return (self.req("/rest/system/status") or {}).get("myID", "")
 
-    def folders(self):
-        return self.req("/rest/config/folders") or []
+def _git(args, check=True):
+    env = child_env()
+    env.update(_GIT_ENV)
+    r = subprocess.run(["git"] + args, cwd=SYNC_WORKDIR, capture_output=True,
+                       timeout=900, creationflags=CREATE_NO_WINDOW, env=env)
+    if check and r.returncode != 0:
+        msg = (r.stderr or r.stdout).decode("utf-8", "replace").strip()
+        raise RuntimeError(msg or f"git {' '.join(args[:2])} 失败 (exit {r.returncode})")
+    return r.stdout.decode("utf-8", "replace")
 
-    def folder_status(self, fid):
-        return self.req("/rest/db/status?folder=" + _q(fid)) or {}
 
-    def scan(self, fid):
-        self.req("/rest/db/scan?folder=" + _q(fid), method="POST")
+def _auth_url(url, token):
+    """HTTPS 地址叠加 PAT; SSH 地址原样返回(走本机 git 凭据)."""
+    token = (token or "").strip()
+    if token and url.lower().startswith("https://"):
+        return url.replace("://", "://x-access-token:" + token + "@", 1)
+    return url
 
-    def set_paused(self, fid, paused):
-        f = self.req("/rest/config/folders/" + _q(fid))
-        f["paused"] = bool(paused)
-        self.req("/rest/config/folders/" + _q(fid), method="PUT", body=f)
 
-    def get_ignores(self, fid):
-        return (self.req("/rest/db/ignores?folder=" + _q(fid)) or {}).get("ignore") or []
+def _normalize_url(url):
+    """私库地址默认按 HTTPS 规范化: owner/repo 或 github.com/owner/repo 补全为 https 地址."""
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if re.match(r"^(https?|git|ssh)://", u) or u.startswith("git@"):
+        return u
+    u = u.lstrip("/")
+    if u.lower().startswith("github.com/"):
+        u = u[len("github.com/"):]
+    parts = [p for p in u.split("/") if p]
+    if len(parts) >= 2:
+        owner, repo = parts[0], parts[1]
+        if not repo.endswith(".git"):
+            repo += ".git"
+        return f"https://github.com/{owner}/{repo}"
+    return u
 
-    def set_ignores(self, fid, lines):
-        self.req("/rest/db/ignores?folder=" + _q(fid), method="POST", body={"ignore": lines})
 
-    def device_names(self):
-        return {d.get("deviceID"): (d.get("name") or d.get("deviceID", "")[:7])
-                for d in (self.req("/rest/config/devices") or [])}
+def repo_ready():
+    return os.path.isdir(os.path.join(SYNC_WORKDIR, ".git"))
 
-    def connections(self):
-        cs = (self.req("/rest/system/connections") or {}).get("connections") or {}
-        return {k: v for k, v in cs.items() if isinstance(v, dict) and v.get("connected")}
+
+def repo_prepare(url, token):
+    """clone(空仓库亦可) 到本地同步工作区, 幂等."""
+    url = _normalize_url(url)
+    if not url:
+        raise RuntimeError("未配置私库地址")
+    if not repo_ready():
+        if os.path.isdir(SYNC_WORKDIR):
+            shutil.rmtree(SYNC_WORKDIR, ignore_errors=True)
+        os.makedirs(SYNC_WORKDIR, exist_ok=True)
+        _git(["clone", _auth_url(url, token), "."])
+    _git(["config", "user.name", "opencode-sync"])
+    _git(["config", "user.email", "opencode-sync@local"])
+    return url
+
+
+def _head_branch():
+    return _git(["symbolic-ref", "--short", "HEAD"], check=False).strip() or "main"
+
+
+def _remote_rev(branch):
+    return _git(["rev-parse", "--verify", "origin/" + branch], check=False).strip()
+
+
+def _github_slug(url):
+    m = re.search(r"github\.com[:/](.+?)/(.+?)(?:\.git)?/?$", (url or "").strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def remote_repo_mb(url, token):
+    """GitHub API 查询仓库总大小(KB->MB), 失败返回 None."""
+    slug = _github_slug(url)
+    if not slug:
+        return None
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{slug[0]}/{slug[1]}",
+        headers={"Accept": "application/vnd.github+json"})
+    tok = (token or "").strip()
+    if tok:
+        req.add_header("Authorization", "Bearer " + tok)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8")).get("size", 0) / 1024.0
+    except Exception:
+        return None
+
+
+def _table_cols(con, table, schema="main"):
+    return [r[1] for r in con.execute(f"pragma {schema}.table_info({table})")]
+
+
+def _bundle_where(table, alias):
+    """会话包内某张表按单个会话过滤的条件表达式."""
+    if table == "project":
+        return f"id in (select project_id from {alias}.session where id=?)"
+    if table == "workspace":
+        return f"id in (select workspace_id from {alias}.session where id=?)"
+    if table == "project_directory":
+        return f"project_id in (select project_id from {alias}.session where id=?)"
+    if table == "session":
+        return "id=?"
+    if table in ("event", "event_sequence"):
+        return "aggregate_id=?"
+    return "session_id=?"
+
+
+def _session_meta(src, ids):
+    """导出用的会话清单: 标题/目录/消息数/字节估算."""
+    ph = ",".join("?" * len(ids))
+    metas = {i: {"id": i, "title": "", "directory": "", "msgs": 0, "bytes": 0} for i in ids}
+    for i, t, d, m in src.execute(
+            f"select s.id, s.title, s.directory, "
+            f"(select count(*) from message m where m.session_id=s.id) "
+            f"from session s where s.id in ({ph})", ids):
+        metas[i].update(title=t or "", directory=d or "", msgs=m or 0)
+    for table, col in (("message", "session_id"), ("part", "session_id"), ("event", "aggregate_id")):
+        for sid, b in src.execute(
+                f"select {col}, sum(length(data)) from {table} where {col} in ({ph}) group by {col}", ids):
+            if sid in metas:
+                metas[sid]["bytes"] += b or 0
+    return [metas[i] for i in ids]
+
+
+def export_bundle(root_ids, dest_path, src_path=None):
+    """把 root_ids(含全部子会话)导出成独立会话包, 返回包清单."""
+    src_path = src_path or DB
+    ids = sorted(session_closure(root_ids, src_path))
+    if not ids:
+        raise RuntimeError("没有可导出的会话")
+    ph = ",".join("?" * len(ids))
+    where = {
+        "project": f"id in (select project_id from session where id in ({ph}))",
+        "workspace": f"id in (select workspace_id from session where id in ({ph}))",
+        "project_directory": f"project_id in (select project_id from session where id in ({ph}))",
+        "session": f"id in ({ph})",
+        "message": f"session_id in ({ph})",
+        "part": f"session_id in ({ph})",
+        "todo": f"session_id in ({ph})",
+        "session_share": f"session_id in ({ph})",
+        "session_input": f"session_id in ({ph})",
+        "session_message": f"session_id in ({ph})",
+        "session_context_epoch": f"session_id in ({ph})",
+        "event_sequence": f"aggregate_id in ({ph})",
+        "event": f"aggregate_id in ({ph})",
+    }
+    src = db_ro(src_path)
+    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+    if os.path.isfile(dest_path):
+        os.remove(dest_path)
+    dest = sqlite3.connect(dest_path)
+    try:
+        for t in BUNDLE_TABLES:
+            sql = src.execute("select sql from sqlite_master where type='table' and name=?",
+                              (t,)).fetchone()
+            if sql and sql[0]:
+                dest.execute(sql[0])
+        dest.execute(f"create table {MANIFEST_TABLE} (data text not null)")
+        for t in BUNDLE_TABLES:
+            cols = _table_cols(src, t)
+            if not cols:
+                continue
+            cl = ",".join(cols)
+            rows = src.execute(f"select {cl} from {t} where {where[t]}", ids)
+            dest.executemany(f"insert into {t} ({cl}) values ({','.join('?' * len(cols))})", rows)
+        manifest = {"host": os.environ.get("COMPUTERNAME", "?"),
+                    "time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "sessions": _session_meta(src, ids)}
+        dest.execute(f"insert into {MANIFEST_TABLE} (data) values (?)",
+                     (json.dumps(manifest, ensure_ascii=False),))
+        dest.commit()
+        dest.execute("VACUUM")
+    finally:
+        dest.close()
+        src.close()
+    manifest["size"] = os.path.getsize(dest_path)
+    with open(dest_path, "rb") as f:
+        manifest["zsize"] = len(zlib.compress(f.read(), 6))
+    return manifest
+
+
+def read_bundle_manifest(path):
+    try:
+        con = sqlite3.connect(f"file:{path.replace(os.sep, '/')}?mode=ro", uri=True)
+        try:
+            row = con.execute(f"select data from {MANIFEST_TABLE}").fetchone()
+            return json.loads(row[0]) if row else {}
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
+
+def _copy_from_bundle(con, alias, table, sid):
+    """把会话包 alias 中某会话在 table 里的行并入本地(表结构取两边列名交集)."""
+    lcols = _table_cols(con, table)
+    bcols = _table_cols(con, table, alias)
+    cols = [c for c in lcols if c in bcols]
+    if not cols:
+        return
+    cl = ",".join(cols)
+    con.execute(f"insert or {_COPY_MODE[table]} into main.{table} ({cl}) "
+                f"select {cl} from {alias}.{table} where {_bundle_where(table, alias)}", (sid,))
+
+
+def _drop_session_rows(con, sid):
+    con.execute("delete from event where aggregate_id=?", (sid,))
+    con.execute("delete from event_sequence where aggregate_id=?", (sid,))
+    con.execute("delete from session where id=?", (sid,))
+
+
+def sync_merge_bundles(paths, dst_path=None):
+    """把选定的会话包并入本地库; 包内会话以包内版本为准覆盖同名会话."""
+    paths = [p for p in paths if os.path.isfile(p)]
+    if not paths:
+        raise RuntimeError("没有选择会话包")
+    added, replaced, hosts = [], [], []
+    con = sqlite3.connect(dst_path or DB, timeout=30, isolation_level=None)
+    aliases = []
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+        # ATTACH 必须在事务之外, DETACH 必须在提交之后, 否则报 database is locked.
+        for k, path in enumerate(paths):
+            alias = f"b{k}"
+            con.execute(f"ATTACH DATABASE ? AS {alias}", (path,))
+            aliases.append(alias)
+        con.execute("BEGIN IMMEDIATE")
+        for alias in aliases:
+            row = con.execute(f"select data from {alias}.{MANIFEST_TABLE}").fetchone()
+            manifest = json.loads(row[0]) if row else {}
+            hosts.append(manifest.get("host", "?"))
+            sids = [s.get("id") for s in (manifest.get("sessions") or []) if s.get("id")]
+            if not sids:
+                sids = [r[0] for r in con.execute(f"select id from {alias}.session")]
+            for sid in sids:
+                existed = con.execute("select count(*) from session where id=?",
+                                      (sid,)).fetchone()[0]
+                _drop_session_rows(con, sid)
+                for t in BUNDLE_TABLES:
+                    _copy_from_bundle(con, alias, t, sid)
+                (replaced if existed else added).append(sid)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        for alias in aliases:
+            try:
+                con.execute(f"DETACH DATABASE {alias}")
+            except sqlite3.Error:
+                pass
+        con.close()
+    return {"added": added, "replaced": replaced, "hosts": sorted(set(hosts))}
+
+
+def sync_push_sessions(host, root_ids):
+    """把所选会话导出成会话包并推送到私库; 返回包清单."""
+    cfg = load_sync_cfg()
+    url = repo_prepare(cfg.get("repo_url"), cfg.get("token"))
+    branch = _head_branch()
+    _git(["fetch", "origin"])
+    if _remote_rev(branch):
+        _git(["reset", "--hard", "origin/" + branch])
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_host = re.sub(r"[^A-Za-z0-9_.-]", "_", host or "pc") or "pc"
+    dest = os.path.join(SYNC_WORKDIR, BUNDLE_DIR, f"{stamp}-{safe_host}{BUNDLE_EXT}")
+    manifest = export_bundle(root_ids, dest)
+    if manifest["zsize"] > DB_LIMIT_MB << 20:
+        os.remove(dest)
+        raise RuntimeError(f"会话包压缩后约 {human_size(manifest['zsize'])}, 超过 "
+                           f"{DB_LIMIT_MB}MB (GitHub 单文件硬限 100MB).\n"
+                           "请减少所选会话(尤其是超大的旧会话), 或先删除部分旧会话再上传.")
+    _git(["add", "-A"])
+    _git(["commit", "-m", f"sessions {safe_host} {stamp} "
+                          f"({len(manifest['sessions'])} sessions)"])
+    auth = _auth_url(url, cfg.get("token"))
+    try:
+        _git(["push", auth, branch])
+    except RuntimeError:
+        _git(["fetch", "origin"])
+        _git(["rebase", "origin/" + branch], check=False)
+        _git(["push", auth, branch])
+    write_marker(host)
+    return manifest
+
+
+def sync_remote():
+    """拉取远端: 最近提交 + 仓库总量 + 会话包清单(含是否本机已有)."""
+    cfg = load_sync_cfg()
+    url = repo_prepare(cfg.get("repo_url"), cfg.get("token"))
+    branch = _head_branch()
+    _git(["fetch", "origin"])
+    out = {"commit": None, "repo_mb": remote_repo_mb(url, cfg.get("token")), "bundles": []}
+    if _remote_rev(branch):
+        out["commit"] = _git(["log", "-1", "--date=iso",
+                              "--format=%h %ci", "origin/" + branch]).strip()
+        _git(["reset", "--hard", "origin/" + branch])
+    local = set()
+    try:
+        con = db_ro()
+        try:
+            local = {r[0] for r in con.execute("select id from session")}
+        finally:
+            con.close()
+    except Exception:
+        pass
+    d = os.path.join(SYNC_WORKDIR, BUNDLE_DIR)
+    if os.path.isdir(d):
+        for name in os.listdir(d):
+            if not name.endswith(BUNDLE_EXT):
+                continue
+            p = os.path.join(d, name)
+            m = read_bundle_manifest(p)
+            if not m:
+                continue
+            sess = m.get("sessions") or []
+            out["bundles"].append({
+                "file": name, "path": p,
+                "host": m.get("host", "?"), "time": m.get("time", "-"),
+                "count": len(sess), "size": os.path.getsize(p),
+                "bytes": sum(int(s.get("bytes") or 0) for s in sess),
+                "msgs": sum(int(s.get("msgs") or 0) for s in sess),
+                "new": sum(1 for s in sess if s.get("id") not in local),
+                "titles": [s.get("title", "") for s in sess],
+                "dirs": sorted({s.get("directory", "") for s in sess if s.get("directory")}),
+            })
+    out["bundles"].sort(key=lambda b: (b["time"], b["file"]), reverse=True)
+    return out
 
 
 # ---------------- sqlite ----------------
 
-def db_ro():
-    return sqlite3.connect(f"file:{DB.replace(os.sep, '/')}?mode=ro", uri=True)
+def db_ro(path=None):
+    return sqlite3.connect(f"file:{(path or DB).replace(os.sep, '/')}?mode=ro", uri=True)
 
 
 def list_sessions():
@@ -128,8 +459,8 @@ def list_sessions():
         con.close()
 
 
-def session_closure(root_ids):
-    con = db_ro()
+def session_closure(root_ids, src_path=None):
+    con = db_ro(src_path)
     try:
         todo, allids = list(root_ids), set(root_ids)
         while todo:
@@ -158,6 +489,42 @@ def related_counts(ids):
         }
     finally:
         con.close()
+
+
+def session_size_map():
+    """{顶层会话id: 估算字节数} — message/part/event 数据长度按子会话归并到顶层."""
+    child = {}
+    roots = set()
+    con = db_ro()
+    try:
+        for sid, pid in con.execute("select id, parent_id from session"):
+            if pid:
+                child[sid] = pid
+            else:
+                roots.add(sid)
+        sums = {}
+        for sql in ("select session_id, sum(length(data)) from message group by session_id",
+                    "select session_id, sum(length(data)) from part group by session_id",
+                    "select aggregate_id, sum(length(data)) from event group by aggregate_id"):
+            for sid, b in con.execute(sql):
+                sums[sid] = sums.get(sid, 0) + (b or 0)
+    finally:
+        con.close()
+
+    def top(sid):
+        seen = set()
+        while sid in child and sid not in seen:
+            seen.add(sid)
+            sid = child[sid]
+        return sid
+
+    out = {}
+    for sid, b in sums.items():
+        r = top(sid)
+        out[r] = out.get(r, 0) + b
+    for r in roots:
+        out.setdefault(r, 0)
+    return out
 
 
 def delete_sessions(root_ids):
@@ -191,10 +558,23 @@ def wal_checkpoint():
         con.close()
 
 
+def vacuum_db():
+    """重建库文件回收空闲页(删除会话后调用), 需 opencode 已退出."""
+    before = os.path.getsize(DB) if os.path.isfile(DB) else 0
+    con = sqlite3.connect(DB, timeout=60, isolation_level=None)
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.execute("VACUUM")
+    finally:
+        con.close()
+    after = os.path.getsize(DB) if os.path.isfile(DB) else 0
+    return before, after
+
+
 def opencode_running():
     try:
         out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq opencode.exe", "/NH"],
-                             capture_output=True, timeout=10,
+                             capture_output=True, timeout=10, env=child_env(),
                              creationflags=CREATE_NO_WINDOW).stdout.decode("gbk", "replace")
         return "opencode.exe" in out.lower()
     except Exception:
@@ -523,7 +903,7 @@ def running_sessions():
     out = {}
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", _WMI_PS],
-                           capture_output=True, timeout=15,
+                           capture_output=True, timeout=15, env=child_env(),
                            creationflags=CREATE_NO_WINDOW)
         txt = r.stdout.decode("utf-8", "replace").strip()
         if not txt:
@@ -606,13 +986,14 @@ class SessionsTab(Fr):
         self.statcb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
         mkbtn(bar, "进入会话", self.open_session, "primary").pack(side="left", padx=2)
         mkbtn(bar, "打开目录", self.reveal_dir).pack(side="left", padx=2)
+        mkbtn(bar, "上传所选会话", self.upload_selected).pack(side="left", padx=2)
         mkbtn(bar, "删除会话", self.delete_session, "danger").pack(side="left", padx=2)
         self.toolbar = bar
-        cols = ("status", "time", "msgs", "title", "dir")
+        cols = ("status", "time", "msgs", "size", "title", "dir")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
         for c, w, txt, st in (("status", 96, "状态", False), ("time", 124, "更新时间", False),
-                              ("msgs", 56, "消息", False), ("title", 320, "标题", True),
-                              ("dir", 320, "目录", True)):
+                              ("msgs", 56, "消息", False), ("size", 82, "大小", False),
+                              ("title", 320, "标题", True), ("dir", 320, "目录", True)):
             self.tree.heading(c, text=txt)
             self.tree.column(c, width=w, anchor="w", stretch=st, minwidth=56 if not st else 160)
         self.tree.tag_configure("odd", background=ODD)
@@ -630,12 +1011,14 @@ class SessionsTab(Fr):
         menu = tk.Menu(self, tearoff=0, **_menu_colors())
         menu.add_command(label="进入会话", command=self.open_session)
         menu.add_command(label="打开所在目录", command=self.reveal_dir)
+        menu.add_command(label="上传所选会话", command=self.upload_selected)
         menu.add_command(label="删除会话", command=self.delete_session)
         self.tree.bind("<Button-3>", lambda e: (self.tree.identify_row(e.y)
                      and self.tree.selection_set(self.tree.identify_row(e.y)),
                      menu.tk_popup(e.x_root, e.y_root)))
         self.rows = []
         self.smap = {}
+        self.sizes = {}
         self._loading = False
 
     def load(self):
@@ -646,7 +1029,7 @@ class SessionsTab(Fr):
 
         def work():
             rows = list_sessions()
-            return rows, session_status_map([r[0] for r in rows])
+            return rows, session_status_map([r[0] for r in rows]), session_size_map()
         run_bg(work, on_ok=self._after_load,
                on_err=lambda e: (self._set_load_flag(False),
                                  self.status.config(text=f"读取会话失败: {e}")))
@@ -656,9 +1039,10 @@ class SessionsTab(Fr):
 
     def _after_load(self, res):
         self._loading = False
-        rows, smap = res
+        rows, smap, sizes = res
         self.rows = rows
         self.smap = smap
+        self.sizes = sizes
         cur = self.dirf.get()
         dirs = ["全部"] + sorted({r[2] for r in rows})
         self.dircb.config(values=dirs)
@@ -692,8 +1076,10 @@ class SessionsTab(Fr):
             if kind != "idle":
                 tags += (kind,)
             disp = f"● {txt}" if kind == "run" else txt
+            b = self.sizes.get(r[0], 0)
             t.insert("", "end", iid=r[0], tags=tags,
                      values=(disp, human_time(r[3]), r[4],
+                             human_size(b) if b else "-",
                              (r[1] or "").strip().replace("\n", " ")[:56], r[2]))
             n += 1
         for k in keep:
@@ -702,7 +1088,10 @@ class SessionsTab(Fr):
                     t.selection_add(k)
                 except Exception:
                     pass
-        self.status.config(text=f"显示 {n} / {len(self.rows)} · 运行中 {runc} · 近期活跃 {actc} · 双击进入, F5 刷新")
+        total = sum(self.sizes.values())
+        self.status.config(text=f"显示 {n} / {len(self.rows)} · 运行中 {runc} · 近期活跃 {actc}"
+                                f" · 会话合计 {human_size(total)} · 可多选后点[上传所选会话]"
+                                f" · 双击进入, F5 刷新")
 
     def update_status(self):
         if not self.rows or self._loading:
@@ -762,7 +1151,8 @@ class SessionsTab(Fr):
                                            "仍要创建空目录并进入?"):
                     continue
                 os.makedirs(d, exist_ok=True)
-            subprocess.Popen([exe, "--session", sid], cwd=d, creationflags=CREATE_NEW_CONSOLE)
+            subprocess.Popen([exe, "--session", sid], cwd=d, env=child_env(),
+                             creationflags=CREATE_NEW_CONSOLE)
         self.after(1500, self.update_status)
 
     def reveal_dir(self):
@@ -771,7 +1161,7 @@ class SessionsTab(Fr):
             return
         d = self._rows_map()[sids[0]][2].replace("/", os.sep)
         if os.path.isdir(d):
-            subprocess.Popen(["explorer", d])
+            subprocess.Popen(["explorer", d], env=child_env())
         else:
             Msg.info("提示", f"目录不存在:\n{d}")
 
@@ -814,247 +1204,267 @@ class SessionsTab(Fr):
                                    Msg.info("完成", f"已删除 {len(gone)} 个会话(含子会话).")),
                on_err=lambda e: Msg.error("删除失败", str(e)))
 
+    def upload_selected(self):
+        sids = self.selected()
+        if not sids:
+            Msg.info("提示", "先在列表中选中要上传的会话(可多选)")
+            return
+        cfg = load_sync_cfg()
+        if not (cfg.get("repo_url") or "").strip():
+            Msg.warning("未配置私库", "请先到[会话同步]页填写私库地址和 PAT, 点[保存并准备仓库].")
+            return
+        if not repo_ready():
+            Msg.warning("未就绪", "同步工作区尚未就绪, 请先到[会话同步]页点[保存并准备仓库].")
+            return
+        if not shutil.which("git"):
+            Msg.error("缺少 Git", "未找到 git 命令, 请先安装 Git.")
+            return
+        ids = session_closure(sids)
+        rows = self._rows_map()
+        est = sum(self.sizes.get(s, 0) for s in sids)
+        names = "\n".join(f"  · {(rows[s][1] or '').strip()[:44]}" for s in sids[:8] if s in rows)
+        more = f"\n  ... 等共 {len(sids)} 个" if len(sids) > 8 else ""
+        if not Msg.askyesno("上传所选会话",
+                            f"将上传 {len(sids)} 个会话(连同子会话共 {len(ids)} 个):\n{names}{more}\n\n"
+                            f"本地数据量约 {human_size(est)}\n\n"
+                            "会把会话导出成独立会话包并推送到 GitHub 私库, 供其他电脑按需并入. 继续?"):
+            return
+        host = os.environ.get("COMPUTERNAME", "?")
+
+        def done(m):
+            self.status.config(text=f"已上传 {len(m['sessions'])} 个会话"
+                                    f" · 包 {human_size(m['size'])}")
+            Msg.info("上传完成",
+                     f"会话包: {human_size(m['size'])} (压缩后约 {human_size(m['zsize'])})\n"
+                     f"含 {len(m['sessions'])} 个会话\n\n"
+                     "到另一台电脑[会话同步]页点[刷新远端会话包], 选中后点[下载并并入所选].")
+
+        self.status.config(text="正在导出并上传所选会话...")
+        run_bg(lambda: sync_push_sessions(host, sids),
+               on_ok=done,
+               on_err=lambda e: (self.status.config(text="上传失败"),
+                                 Msg.error("上传失败", str(e))))
+
 
 class SyncTab(Fr):
     def __init__(self, master):
         super().__init__(master, padding=(10, 8))
-        self.st = Syncthing()
-        self.names = {}
+        self.cfg = load_sync_cfg()
         top = Fr(self)
         top.pack(fill="x")
         self.info = L(top, text="", wraplength=980, justify="left")
         self.info.pack(anchor="w")
-        row = Fr(self)
-        row.pack(fill="x", pady=4)
-        for text, cmd in (("刷新", self.load), ("立即同步(选中)", self.scan_sel),
-                          ("暂停/恢复", self.toggle_pause), ("忽略规则(选中)", self.edit_ignores),
-                          ("打开目录(选中)", self.open_dir)):
-            mkbtn(row, text, cmd).pack(side="left", padx=2)
+        rowc = Fr(self)
+        rowc.pack(fill="x", pady=4)
+        L(rowc, text="私库(HTTPS):").pack(side="left")
+        self.url_ent = Ent(rowc, width=38)
+        self.url_ent.pack(side="left", padx=4)
+        self.url_ent.insert(0, self.cfg.get("repo_url", ""))
+        L(rowc, text="PAT:").pack(side="left")
+        self.tok_ent = Ent(rowc, width=16, show="*")
+        self.tok_ent.pack(side="left", padx=4)
+        self.tok_ent.insert(0, self.cfg.get("token", ""))
+        mkbtn(rowc, "保存并准备仓库", self.prepare_repo, "primary").pack(side="left", padx=2)
         row2 = Fr(self)
         row2.pack(fill="x", pady=(0, 4))
-        mkbtn(row2, "本机收尾并等同步完成 (oc-out)", self.do_out).pack(side="left", padx=2)
-        mkbtn(row2, "等待拉取并接管本机 (oc-in)", self.do_in, "primary").pack(side="left", padx=2)
-        self.toolbar = row
+        mkbtn(row2, "刷新远端会话包", self.show_remote).pack(side="left", padx=2)
+        mkbtn(row2, "下载并并入所选", self.do_merge, "primary").pack(side="left", padx=2)
+        mkbtn(row2, "刷新统计", self.refresh).pack(side="left", padx=2)
+        mkbtn(row2, "压缩数据库(VACUUM)", self.vacuum).pack(side="left", padx=2)
+        self.toolbar = rowc
         self.toolbar2 = row2
-        L(self, text="切换助手: 同一时刻只在一台电脑活跃. 换机前在旧机点 [收尾], 到新机点 [接管].",
-          foreground=MUT).pack(anchor="w")
-        cols = ("label", "state", "need", "path", "paused")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
-        for c, w, txt, st, anchor, minimum in (
-                ("label", 170, "目录", False, "w", 130),
-                ("state", 88, "状态", False, "center", 76),
-                ("need", 112, "待传", False, "center", 104),
-                ("path", 360, "路径", True, "w", 220),
-                ("paused", 76, "暂停", False, "center", 64)):
+        L(self, text="上传: 到[会话管理]勾选会话, 点[上传所选会话]导出成独立会话包推送(可多次增量上传).\n"
+                     "下载: 点[刷新远端会话包], 选中要并入的包, 再点[下载并并入所选]; "
+                     "包内会话会以包内版本覆盖本机同名会话, 其它会话不受影响.\n"
+                     "项目代码请照常用 Git 手动同步; 私库请确保仅自己可见.",
+          foreground=MUT, justify="left").pack(anchor="w")
+        cols = ("item", "value", "note")
+        self.stats = ttk.Treeview(self, columns=cols, show="headings", height=7, selectmode="none")
+        for c, w, txt, a in (("item", 180, "项目", "w"), ("value", 200, "数值", "w"),
+                             ("note", 420, "说明", "w")):
+            self.stats.heading(c, text=txt)
+            self.stats.column(c, width=w, anchor=a, minwidth=90)
+        self.stats.tag_configure("odd", background=ODD)
+        self.stats.tag_configure("even", background=EVEN)
+        L(self, text="远端会话包(可多选):").pack(anchor="w", pady=(6, 0))
+        cols2 = ("time", "host", "count", "size", "new", "file")
+        self.tree = ttk.Treeview(self, columns=cols2, show="headings", selectmode="extended")
+        for c, w, txt, a in (("time", 140, "上传时间", "w"), ("host", 110, "来源机器", "w"),
+                             ("count", 60, "会话", "w"), ("size", 90, "包大小", "w"),
+                             ("new", 90, "本机缺", "w"), ("file", 240, "会话包", "w")):
             self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, anchor=anchor, stretch=st, minwidth=minimum)
+            self.tree.column(c, width=w, anchor=a, minwidth=58)
         self.tree.tag_configure("odd", background=ODD)
         self.tree.tag_configure("even", background=EVEN)
         self.progress = L(self, text="")
         self.progress.pack(side="bottom", fill="x")
-        self.hscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(xscrollcommand=self.hscroll.set)
-        self.hscroll.pack(side="bottom", fill="x", pady=(0, 4))
+        self.stats.pack(fill="x", pady=(4, 0))
         self.tree.pack(fill="both", expand=True, pady=4)
-        self.poll_job = None
-        self.summary = "连接中..."
-        if self.st.err:
-            self.info.config(text=f"Syncthing: {self.st.err}")
-        else:
-            self.load()
+        self._st = None
+        self._remote = None
+        self._bundles = []
+        self.refresh()
 
-    def load(self):
-        self.progress.config(text="")
+    # ---------- 本地统计 ----------
 
-        def work():
-            if not self.st.alive():
-                return ("down", [], {}, {})
-            fs = self.st.folders()
-            self.names = self.st.device_names()
-            st = {}
-            for f in fs:
-                try:
-                    st[f["id"]] = self.st.folder_status(f["id"])
-                except Exception:
-                    st[f["id"]] = {}
-            return ("ok", fs, st, self.st.connections())
-        run_bg(work, on_ok=self._fill,
-               on_err=lambda e: self.info.config(text=f"Syncthing 查询失败: {e}"))
+    def refresh(self):
+        self.info.config(text=f"配置文件: {SYNC_CFG_FILE}\n同步工作区: {SYNC_WORKDIR}")
+        run_bg(db_stats, on_ok=self._fill_local,
+               on_err=lambda e: self._fill_local(
+                   {"db": 0, "wal": 0, "sessions": 0, "messages": 0, "parts": 0, "zdb": 0}))
 
-    def _fill(self, r):
-        kind, fs, st, conns = r
-        self._last = (kind, fs, st, conns)
-        marker = read_marker() or "-"
-        online = ", ".join(self.names.get(k, k[:7]) for k in conns) if conns else "(无对端在线)"
-        self.info.config(text=f"Syncthing: {'运行中' if kind == 'ok' else '未运行/未安装'}"
-                              f"    活跃标记机器: {marker}    在线设备: {online}")
-        t = self.tree
-        keep = t.selection()
+    def _fill_local(self, st):
+        self._st = st
+        self._render()
+
+    def _render(self):
+        st = self._st or {"db": 0, "wal": 0, "sessions": 0, "messages": 0, "parts": 0, "zdb": 0}
+        rows = [
+            ("本地会话库", human_size(st["db"]), DB if st["db"] else "未找到会话数据库"),
+            ("WAL 日志", human_size(st["wal"]), "checkpoint 后归零"),
+            ("压缩后估算", "约 " + human_size(st["zdb"]), "整库上传的参考值(会话包按所选会话另行计算)"),
+            ("会话 / 消息 / 数据块",
+             f"{st['sessions']} / {st['messages']} / {st['parts']}", "顶层会话与关联消息统计"),
+        ]
+        warn = st["zdb"] > DB_WARN_MB << 20
+        limit = st["zdb"] > DB_LIMIT_MB << 20
+        rows.append(("整库体积状态",
+                     "超限, 无法整库上传" if limit else ("偏大, 注意清理" if warn else "正常"),
+                     f"预警线 {DB_WARN_MB}MB, 上限 {DB_LIMIT_MB}MB (按压缩后估算, GitHub 单文件硬限 100MB)"))
+        r = self._remote
+        if r:
+            mb = r.get("repo_mb")
+            rows.append(("远端最近上传", (r.get("commit") or "从未上传"),
+                         "origin 分支最新提交" if r.get("commit") else "还没有任何会话包"))
+            rows.append(("远端会话包", f"{len(r['bundles'])} 个",
+                         "选中后可并入本机; 每个包含上传时勾选的会话"))
+            rows.append(("远端仓库总量", (f"约 {mb:.1f} MB" if mb is not None else "-"),
+                         "含全部历史提交, 可到 GitHub 清理历史压缩体积"))
+        t = self.stats
         t.delete(*t.get_children())
-        for i, f in enumerate(fs):
-            s = st.get(f["id"], {})
-            need = s.get("needBytes", 0)
-            t.insert("", "end", iid=f["id"], tags=("odd",) if i % 2 else ("even",),
-                     values=(f.get("label") or f["id"], s.get("state", "?"),
-                             (human_size(need) + " 待传") if need else "-",
-                             f.get("path"), "是" if f.get("paused") else ""))
-        for k in keep:
-            if t.exists(k):
-                t.selection_set(k)
-        if self.poll_job:
-            t.after_cancel(self.poll_job)
-        if kind == "ok":
-            self.poll_job = t.after(4000, self._light_refresh)
+        for i, row in enumerate(rows):
+            t.insert("", "end", iid="L" + str(i), tags=("odd",) if i % 2 else ("even",), values=row)
 
-    def _light_refresh(self):
-        self.poll_job = None
-        ids = self.tree.get_children()
-        if not ids:
+    # ---------- 配置与准备 ----------
+
+    def prepare_repo(self):
+        url = _normalize_url(self.url_ent.get())
+        if not url:
+            Msg.warning("缺少配置", "请先填写 GitHub 私库地址, 例如:\n"
+                        "you/opencode-sync   或   https://github.com/you/opencode-sync.git\n"
+                        "默认按 HTTPS 方式访问.")
             return
-
-        def work():
-            out = {}
-            for iid in ids:
-                try:
-                    s = self.st.folder_status(iid)
-                    need = s.get("needBytes", 0)
-                    out[iid] = (s.get("state", "?"),
-                                (human_size(need) + " 待传") if need else "-")
-                except Exception:
-                    out[iid] = None
-            return out
-
-        def done(res):
-            for iid, val in (res or {}).items():
-                if val and self.tree.exists(iid):
-                    vals = list(self.tree.item(iid, "values"))
-                    vals[1], vals[2] = val
-                    self.tree.item(iid, values=vals)
-            if self.tree.winfo_exists():
-                self.poll_job = self.tree.after(4000, self._light_refresh)
-        run_bg(work, on_ok=done, on_err=lambda e: None)
-
-    def _sel(self):
-        s = self.tree.selection()
-        if not s:
-            Msg.info("提示", "先在表中选中一个同步目录")
-        return s[0] if s else None
-
-    def scan_sel(self):
-        fid = self._sel()
-        if fid:
-            run_bg(lambda: self.st.scan(fid), on_ok=lambda _: self.progress.config(text="已触发扫描"),
-                   on_err=lambda e: Msg.error("失败", str(e)))
-
-    def toggle_pause(self):
-        fid = self._sel()
-        if not fid:
+        if not shutil.which("git"):
+            Msg.error("缺少 Git", "未找到 git 命令, 请先安装 Git.")
             return
-        want = self.tree.item(fid, "values")[4] != "是"
-        run_bg(lambda: self.st.set_paused(fid, want), on_ok=lambda _: self.load(),
-               on_err=lambda e: Msg.error("失败", str(e)))
+        self.url_ent.delete(0, "end")
+        self.url_ent.insert(0, url)
+        self.cfg = {"repo_url": url, "token": self.tok_ent.get().strip()}
+        save_sync_cfg(self.cfg)
+        self.progress.config(text="正在克隆/检查仓库...")
+        run_bg(lambda: repo_prepare(url, self.cfg.get("token")),
+               on_ok=lambda _: (self.progress.config(text="仓库就绪"),
+                                Msg.info("仓库就绪", f"同步工作区已就绪:\n{url}\n\n"
+                                                     "可以到[会话管理]勾选会话上传, 或点[刷新远端会话包]查看远端.")),
+               on_err=lambda e: (self.progress.config(text=""), Msg.error("准备失败", str(e))))
 
-    def open_dir(self):
-        fid = self._sel()
-        if fid:
-            p = self.tree.item(fid, "values")[3]
-            if os.path.isdir(p):
-                subprocess.Popen(["explorer", p])
-
-    def edit_ignores(self):
-        fid = self._sel()
-        if not fid:
-            return
-        try:
-            lines = self.st.get_ignores(fid)
-        except Exception as e:
-            Msg.error("读取失败", str(e))
-            return
-        win = TL(self)
-        win.title(f"忽略规则 - {self.tree.item(fid, 'values')[0]}")
-        win.geometry("560x400")
-        L(win, text="每行一条 Syncthing 忽略模式(留空行将被移除), 保存即生效并同步到对端:").pack(anchor="w", padx=6, pady=4)
-        txt = tk.Text(win, wrap="none", bg=CARD, fg=FG, insertbackground=FG, relief="flat",
-                      highlightthickness=1, highlightbackground=GRID, font=(UI_FONT, 10))
-        txt.insert("1.0", "\n".join(lines))
-        txt.pack(fill="both", expand=True, padx=6, pady=4)
-
-        def save():
-            new = [l for l in txt.get("1.0", "end").splitlines() if l.strip()]
-            run_bg(lambda: self.st.set_ignores(fid, new),
-                   on_ok=lambda _: (Msg.info("已保存", "忽略规则已写入."), win.destroy()),
-                   on_err=lambda e: Msg.error("保存失败", str(e)))
-        mkbtn(win, "保存", save, "primary").pack(anchor="e", padx=6, pady=6)
-
-    def _st_ready(self):
-        if self.st.err or not self.st.alive():
-            Msg.warning("不可用", "Syncthing 未运行, 无法执行切换流程.")
+    def _need_ready(self):
+        if not (self.cfg.get("repo_url") or "").strip():
+            Msg.warning("缺少配置", "请先填写私库地址并点[保存并准备仓库].")
+            return False
+        if not repo_ready():
+            Msg.warning("未就绪", "同步工作区尚未就绪, 请先点[保存并准备仓库].")
             return False
         return True
 
-    def _poll_sync(self, done_cb):
-        start = _time.time()
+    # ---------- 远端会话包 ----------
 
-        def tick():
-            def work():
-                pend = []
-                for f in self.st.folders():
-                    s = self.st.folder_status(f["id"])
-                    if s.get("state") != "idle" or s.get("needBytes", 0) > 0:
-                        pend.append(f.get("label") or f["id"])
-                return pend
+    def show_remote(self):
+        if not self._need_ready():
+            return
+        self.progress.config(text="正在拉取远端会话包列表...")
+        run_bg(sync_remote, on_ok=self._fill_remote,
+               on_err=lambda e: (self.progress.config(text=""), Msg.error("刷新失败", str(e))))
 
-            def ok(pend):
-                if not pend:
-                    done_cb(True, "同步完成")
-                    return
-                if _time.time() - start > ST_TIMEOUT:
-                    done_cb(False, f"等待超时({ST_TIMEOUT}s), 请确认对端在线后刷新状态")
-                    return
-                self.progress.config(text="同步中: " + ", ".join(pend))
-                self.tree.after(2000, tick)
-            run_bg(work, on_ok=ok, on_err=lambda e: done_cb(False, f"状态查询失败: {e}"))
-        tick()
+    def _fill_remote(self, r):
+        self.progress.config(text="")
+        self._remote = r
+        self._bundles = r.get("bundles") or []
+        t = self.tree
+        t.delete(*t.get_children())
+        for i, b in enumerate(self._bundles):
+            t.insert("", "end", iid=b["file"], tags=("odd",) if i % 2 else ("even",),
+                     values=(b["time"], b["host"], b["count"], human_size(b["size"]),
+                             f"{b['new']}/{b['count']}", b["file"]))
+        self._render()
+        if not self._bundles:
+            self.progress.config(text="远端还没有会话包, 请先在另一台电脑上传所选会话")
+        else:
+            self.progress.config(text=f"远端共 {len(self._bundles)} 个会话包")
 
-    def do_out(self):
-        if not self._st_ready():
+    # ---------- 压缩数据库 ----------
+
+    def vacuum(self):
+        if opencode_running():
+            Msg.warning("opencode 正在运行", "请在全部 opencode 退出后再压缩数据库.")
+            return
+        cur = (self._st or {}).get("db", 0)
+        if not Msg.askyesno("压缩数据库",
+                            f"当前库 {human_size(cur)}.\n\n"
+                            "VACUUM 会重建数据库文件, 回收删除会话后残留的空闲页,\n"
+                            "期间需要约两倍磁盘空间, 且必须已退出全部 opencode.\n继续?"):
+            return
+        self.progress.config(text="正在压缩数据库(可能需要一两分钟)...")
+        run_bg(vacuum_db, on_ok=self._vacuumed,
+               on_err=lambda e: (self.progress.config(text=""), Msg.error("压缩失败", str(e))))
+
+    def _vacuumed(self, r):
+        before, after = r
+        self.refresh()
+        self.progress.config(text=f"压缩完成: {human_size(before)} → {human_size(after)}")
+        Msg.info("压缩完成", f"库体积 {human_size(before)} → {human_size(after)}.\n"
+                 "请到[会话管理]按 F5 确认会话数据仍在.")
+
+    # ---------- 下载并并入所选 ----------
+
+    def do_merge(self):
+        if not self._need_ready():
+            return
+        sel = self.tree.selection()
+        if not sel:
+            Msg.info("提示", "先点[刷新远端会话包], 再选中要并入的会话包(可多选)")
             return
         if opencode_running():
-            Msg.warning("opencode 正在运行", "请先退出全部 opencode 窗口, 再执行收尾同步.")
+            Msg.warning("opencode 正在运行", "并入会话库前请先退出本机全部 opencode 窗口.")
             return
-        if not Msg.askyesno("切换收尾", "将执行: WAL checkpoint → 写活跃标记 → 等待同步完成.\n"
-                            "对端电脑在此完成前不要启动 opencode. 继续?"):
+        picks = [b for b in self._bundles if b["file"] in set(sel)]
+        n = sum(b["count"] for b in picks)
+        over = sum(b["count"] - b["new"] for b in picks)
+        detail = "\n".join(f"  · {b['time']} [{b['host']}] {b['count']} 个会话"
+                           for b in picks[:6])
+        more = f"\n  ... 共 {len(picks)} 个包" if len(picks) > 6 else ""
+        dirs = sorted({d for b in picks for d in b["dirs"]})
+        if not Msg.askyesno("下载并并入",
+                            f"将并入 {len(picks)} 个会话包, 共 {n} 个会话:\n{detail}{more}\n\n"
+                            f"其中 {over} 个本机已存在, 会被包内版本覆盖; 其它会话不受影响.\n"
+                            f"涉及目录: {', '.join(dirs[:3]) or '-'}"
+                            f"{' 等' if len(dirs) > 3 else ''}\n"
+                            "项目代码请自行在对应目录 clone/pull. 继续?"):
             return
+        self.progress.config(text="正在并入会话包...")
+        run_bg(lambda: sync_merge_bundles([b["path"] for b in picks]),
+               on_ok=self._merged,
+               on_err=lambda e: (self.progress.config(text=""), Msg.error("并入失败", str(e))))
 
-        def work():
-            wal_checkpoint()
-            write_marker(os.environ.get("COMPUTERNAME", "?"))
-            for f in self.st.folders():
-                self.st.scan(f["id"])
-            return True
-        run_bg(work, on_ok=lambda _: self._poll_sync(
-            lambda ok, msg: self.progress.config(text=("A→B 收尾完成, 可去另一台电脑点[接管]" if ok else msg))),
-            on_err=lambda e: Msg.error("收尾失败", str(e)))
-
-    def do_in(self):
-        if not self._st_ready():
-            return
-        marker = read_marker()
-        me = os.environ.get("COMPUTERNAME", "?")
-        if marker and marker != me and not Msg.askyesno(
-                "确认接管", f"上次活跃机器是 [{marker}], 确认它已退出 opencode 并完成收尾?\n"
-                "否则可能造成会话数据丢失!"):
-            return
-
-        def finish(ok, msg):
-            if not ok:
-                self.progress.config(text=msg)
-                Msg.warning("未完成", msg)
-                return
-            write_marker(me)
-            self.load()
-            Msg.info("接管完成", "本机已成为活跃机器, 到[会话管理]即可进入任意历史会话.")
-        self._poll_sync(finish)
+    def _merged(self, r):
+        self.progress.config(text="")
+        if app_ref:
+            app_ref.tab_sessions.load()
+        run_bg(sync_remote, on_ok=self._fill_remote, on_err=lambda e: None)
+        Msg.info("并入完成",
+                 f"新增 {len(r['added'])} 个会话, 覆盖 {len(r['replaced'])} 个.\n"
+                 f"来源机器: {', '.join(r['hosts']) or '-'}\n\n"
+                 "到[会话管理]按 F5 查看; 若提示目录不存在, 先进目录 clone/pull 项目代码.")
 
 
 def _safe_isdir(e):
@@ -1075,19 +1485,11 @@ class BrowseTab(Fr):
         self.pathcb.pack(side="left", fill="x", expand=True, padx=4)
         self.pathcb.bind("<Return>", lambda e: self.goto(self.pathvar.get()))
         mkbtn(bar, "进入", lambda: self.goto(self.pathvar.get())).pack(side="left")
-        self.roots = {}
-        try:
-            st = Syncthing()
-            if not st.err and st.alive():
-                self.roots = {f.get("label") or f["id"]: f["path"] for f in st.folders()}
-        except Exception:
-            pass
-        if not self.roots:
-            self.roots = {"opencode会话数据": DATA_DIR,
-                          "opencode配置": os.path.join(HOME, ".config", "opencode"),
-                          "claudeproject": os.path.join("D:", os.sep, "PythonProjects", "claudeproject")}
+        self.roots = {"opencode会话数据": DATA_DIR,
+                      "opencode配置": os.path.join(HOME, ".config", "opencode"),
+                      "claudeproject": os.path.join("D:", os.sep, "PythonProjects", "claudeproject")}
         self.hint = L(self, style="Muted.TLabel" if not HAS_TB else None,
-                      text="橙色=同步冲突文件  红色=Syncthing 传输残留  绿色=目录    文件删除/整理请右键“资源管理器中显示”后操作")
+                      text="橙色=历史同步冲突文件  红色=同步临时残留  绿色=目录    文件删除/整理请右键“资源管理器中显示”后操作")
         self.hint.pack(side="bottom", fill="x")
         quick = ttk.LabelFrame(self, text="共享目录")
         quick.pack(fill="x", pady=2)
@@ -1147,7 +1549,7 @@ class BrowseTab(Fr):
                 tag = "dir" if isdir else ""
                 if "sync-conflict" in nm:
                     tag = "conflict"
-                elif nm.startswith(".syncthing."):
+                elif nm.startswith((".syncthing.", ".stfolder")):
                     tag = "sttmp"
                 t.insert("", "end", iid=e.path,
                          values=(("[目录] " if isdir else "") + nm,
@@ -1192,7 +1594,7 @@ class BrowseTab(Fr):
 
 
 _AppBase = tb.Window if HAS_TB else tk.Tk
-NAV_ITEMS = (("会话管理", "sessions"), ("共享同步", "sync"), ("目录浏览", "browse"))
+NAV_ITEMS = (("会话管理", "sessions"), ("会话同步", "sync"), ("目录浏览", "browse"))
 
 
 class App(_AppBase):
@@ -1310,7 +1712,7 @@ class App(_AppBase):
                       "browse": self.tab_browse}
         self.page_meta = {
             "sessions": ("会话管理", "跨目录查看、进入和维护所有 opencode 历史会话"),
-            "sync": ("共享同步", "查看 Syncthing 状态，并安全地在多台电脑之间切换"),
+            "sync": ("会话同步", "勾选的会话导出成独立会话包, 经 GitHub 私库(HTTPS)增量同步; 项目代码请用 Git 自行同步"),
             "browse": ("目录浏览", "浏览共享工作目录，快速定位冲突和同步临时文件"),
         }
         self._cur = None
@@ -1399,8 +1801,7 @@ class App(_AppBase):
         # PyInstaller onefile 引导器靠 _PYI_*/_MEIPASS2 环境变量向子进程传递解压目录.
         # 自重启时若原样继承, 新实例会跳过解压、复用旧进程正在被清理的 _MEI 临时目录,
         # 随即在 Tcl 初始化时报 "Can't find a usable init.tcl". 重启前必须剥离.
-        for k in [k for k in os.environ if k == "_MEIPASS2" or k.startswith("_PYI_")]:
-            os.environ.pop(k, None)
+        env = child_env()
         if _is_frozen():
             args = [sys.executable] + sys.argv[1:]
         else:
@@ -1410,7 +1811,7 @@ class App(_AppBase):
         try:
             subprocess.Popen(args, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             close_fds=True, creationflags=CREATE_NO_WINDOW)
+                             close_fds=True, env=env, creationflags=CREATE_NO_WINDOW)
             self.destroy()
         except Exception:
             os.execv(args[0], args)
@@ -1419,36 +1820,28 @@ class App(_AppBase):
         sids = [r[0] for r in self.tab_sessions.rows]
 
         def work():
-            return (session_status_map(sids) if sids else {}, read_marker())
+            cfg = load_sync_cfg()
+            return (session_status_map(sids) if sids else {}, read_marker(),
+                    bool((cfg.get("repo_url") or "").strip()), repo_ready())
 
         def done(res):
-            smap, marker = res
+            smap, marker, has_cfg, ready = res
             runc = sum(1 for v in smap.values() if v[1] == "run")
             actc = sum(1 for v in smap.values() if v[1] == "act")
             self.badge_run.config(text=f"运行: {runc}  近期: {actc}",
                                   fg=C_SUCCESS if runc else (C_WARNING if actc else MUT))
             me = os.environ.get("COMPUTERNAME", "?")
             self.badge_host.config(text=f"主机: {marker or '-'}" + (" (本机)" if marker == me else ""))
-            st = self.tab_sync
-            summ = "未连接"
-            last = getattr(st, "_last", None)
-            if last:
-                kind, _fs, fst, _c = last
-                if kind != "ok":
-                    summ = "未运行"
-                else:
-                    busy = any(s.get("state") != "idle" or s.get("needBytes", 0) > 0
-                               for s in fst.values())
-                    summ = "同步中" if busy else "已同步"
-            self.badge_sync.config(text=f"同步: {summ}",
-                                   fg=C_WARNING if summ == "同步中" else
-                                   (MUT if summ in ("已同步", "未连接") else C_DANGER))
+            summ = "未配置" if not has_cfg else ("就绪" if ready else "未准备")
+            self.badge_sync.config(text=f"会话同步: {summ}",
+                                   fg=C_SUCCESS if summ == "就绪" else
+                                   (C_WARNING if summ == "未准备" else C_DANGER))
             if self._cur == "sessions":
                 self.tab_sessions.apply_status(smap)
             self._nav_job = self.after(6000, self._tick)
 
         def err(_e):
-            self.badge_sync.config(text="同步: 查询失败", fg=C_DANGER)
+            self.badge_sync.config(text="会话同步: 未知", fg=MUT)
             self._nav_job = self.after(6000, self._tick)
         run_bg(work, on_ok=done, on_err=err)
 
@@ -1466,6 +1859,10 @@ def selftest():
     print("== 1. 会话查询 ==")
     rows = list_sessions()
     print(f"   顶层会话 {len(rows)} 条, 示例: {(rows[0][1] or '')[:20] if rows else '无'}")
+    sizes = session_size_map()
+    top = sorted(sizes.items(), key=lambda kv: -kv[1])[:3]
+    print(f"   会话合计 {human_size(sum(sizes.values()))}; 最大会话: "
+          + (", ".join(f"{sid[:16]}... {human_size(b)}" for sid, b in top) if top else "无"))
     print("== 2. 级联删除 (真实 schema 的内存副本库) ==")
     src = db_ro()
     con = sqlite3.connect(":memory:")
@@ -1501,14 +1898,14 @@ def selftest():
     src.close()
     con.close()
     print("   级联删除 OK")
-    print("== 3. Syncthing REST ==")
-    st = Syncthing()
-    if st.err:
-        print("   ", st.err)
-    else:
-        fs = st.folders()
-        print(f"   myID={st.my_id()[:7]}...  folders={[f['id'] for f in fs]}")
-        print(f"   忽略规则[{fs[0]['id']}]: {len(st.get_ignores(fs[0]['id']))} 条")
+    print("== 3. 会话库统计与同步配置 ==")
+    stt = db_stats()
+    print(f"   库 {human_size(stt['db'])} (WAL {human_size(stt['wal'])})  "
+          f"压缩估算 {human_size(stt['zdb'])}  "
+          f"会话 {stt['sessions']}/消息 {stt['messages']}/数据块 {stt['parts']}")
+    cfg = load_sync_cfg()
+    print(f"   私库: {'已配置 ' + cfg.get('repo_url', '') if cfg.get('repo_url') else '未配置'}"
+          f"  工作区就绪: {repo_ready()}  git 可用: {bool(shutil.which('git'))}")
     print("== 4. 活跃度检测 ==")
     import re as _r
     cmd_re = _r.compile(r"(?:--session|-s)[= ]+(ses_[A-Za-z0-9]+)")
@@ -1525,6 +1922,74 @@ def selftest():
         print(f"   最近活动: {top[0][0]} @ {human_time(top[0][1])}")
     print("== 5. opencode ==")
     print("   running =", opencode_running(), "  exe =", find_opencode_exe())
+    print("== 6. 会话包导出/并入 往返 ==")
+    import tempfile
+    tmp = tempfile.gettempdir()
+    src_db = os.path.join(tmp, "ocp-st-src.db")
+    dst_db = os.path.join(tmp, "ocp-st-dst.db")
+    pkg = os.path.join(tmp, "ocp-st-bundle.db")
+    for p in (src_db, dst_db, pkg):
+        if os.path.isfile(p):
+            os.remove(p)
+    schema = [r[0] for r in db_ro().execute(
+        "select sql from sqlite_master where type='table' and sql is not null")]
+    for p in (src_db, dst_db):
+        c = sqlite3.connect(p)
+        for sql in schema:
+            try:
+                c.execute(sql)
+            except Exception:
+                pass
+        c.commit()
+        c.close()
+    c = sqlite3.connect(src_db)
+    c.execute("insert into project (id,worktree,sandboxes,time_created,time_updated) "
+              "values ('p1','/x','[]',1,1)")
+    c.execute("insert into session (id,project_id,slug,directory,title,version,time_created,time_updated) "
+              "values ('s1','p1','a','/x','t1','v',1,1)")
+    c.execute("insert into session (id,project_id,parent_id,slug,directory,title,version,"
+              "time_created,time_updated) values ('s2','p1','s1','b','/x','sub','v',1,1)")
+    c.execute("insert into message (id,session_id,time_created,time_updated,data) values ('m1','s1',1,1,'{}')")
+    c.execute("insert into part (id,message_id,session_id,time_created,time_updated,data) "
+              "values ('pa1','m1','s1',1,1,'{}')")
+    c.execute("insert into todo (session_id,content,status,priority,position,time_created,time_updated) "
+              "values ('s1','x','pending','high',0,1,1)")
+    c.execute("insert into event_sequence (aggregate_id,seq) values ('s1',1)")
+    c.execute("insert into event (id,aggregate_id,seq,type,data) values ('e1','s1',1,'t','{}')")
+    c.commit()
+    c.close()
+    m = export_bundle(["s1"], pkg, src_path=src_db)
+    print(f"   导出 1 个顶层会话 -> 包内 {len(m['sessions'])} 个会话(含子会话), "
+          f"包 {human_size(m['size'])} (压缩约 {human_size(m['zsize'])})")
+    assert len(m["sessions"]) == 2, "子会话未随包导出!"
+    c = sqlite3.connect(dst_db)
+    c.execute("insert into project (id,worktree,sandboxes,time_created,time_updated) "
+              "values ('p9','/y','[]',1,1)")
+    c.execute("insert into session (id,project_id,slug,directory,title,version,time_created,time_updated) "
+              "values ('s1','p9','z','/z','LOCAL','v',1,1)")
+    c.execute("insert into session (id,project_id,slug,directory,title,version,time_created,time_updated) "
+              "values ('keep','p9','k','/z','keep','v',1,1)")
+    c.commit()
+    c.close()
+    r1 = sync_merge_bundles([pkg], dst_path=dst_db)
+    print(f"   首次并入: 新增 {len(r1['added'])} 覆盖 {len(r1['replaced'])} (来源 {r1['hosts']})")
+    r2 = sync_merge_bundles([pkg], dst_path=dst_db)
+    print(f"   重复并入: 新增 {len(r2['added'])} 覆盖 {len(r2['replaced'])} (应幂等)")
+    c = sqlite3.connect(dst_db)
+    cnt = {t: c.execute(f"select count(*) from {t}").fetchone()[0]
+           for t in ("session", "message", "part", "todo", "event", "event_sequence")}
+    title = c.execute("select title, project_id from session where id='s1'").fetchone()
+    keep = c.execute("select count(*) from session where id='keep'").fetchone()[0]
+    c.close()
+    print(f"   并入后统计: {cnt}; s1 标题/项目={title}; 本地独有会话保留={bool(keep)}")
+    assert cnt["session"] == 3, "并入后会话数不对(应为 s1+s2+keep)"
+    assert cnt["message"] == 1 and cnt["part"] == 1 and cnt["todo"] == 1
+    assert cnt["event"] == 1 and cnt["event_sequence"] == 1, "事件重复或丢失!"
+    assert title == ("t1", "p1"), "包内会话未覆盖本地同名会话!"
+    assert keep == 1, "并入误删了本地独有会话!"
+    for p in (src_db, dst_db, pkg):
+        os.remove(p)
+    print("   会话包导出/并入 OK")
     print("ALL PASS")
 
 
