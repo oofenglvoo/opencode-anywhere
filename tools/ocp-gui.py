@@ -336,26 +336,26 @@ def setup_style(app, theme=None):
     global SEL, ODD, EVEN, GRID, MENU_BG, RUN_BG, ACT_BG, C_SUCCESS, C_WARNING, C_DANGER
     theme = theme or load_theme()
     style = tb.Style(theme="darkly" if theme == "dark" else "flatly") if HAS_TB else ttk.Style(app)
-    if HAS_TB:
-        c = style.colors
-        if theme == "dark":
-            BG, CARD, FG = "#11151c", "#1a202b", "#f3f6fb"
-            SIDEBAR, GRID, MENU_BG = "#0b0e13", "#2a3443", "#1d2430"
-            MUT = "#8d99aa"
-            ACCENT, ACCENT_DARK = "#788cff", "#5d70e6"
-            SUCCESS, WARN, DANGER = "#45d6a0", "#e5ad58", "#ef6f7b"
-            SEL, ODD, EVEN = "#293452", "#151b24", "#11151c"
-            RUN_BG, ACT_BG = "#173a35", "#3d3018"
-        else:
-            BG, CARD, FG = "#f4f6fa", "#ffffff", "#202938"
-            SIDEBAR, GRID, MENU_BG = "#e9edf5", "#d9e0eb", "#ffffff"
-            MUT = "#657186"
-            ACCENT, ACCENT_DARK = "#5267d9", "#4053bd"
-            SUCCESS, WARN, DANGER = "#16805b", "#ae710e", "#c43f4b"
-            SEL, ODD, EVEN = "#e8edff", "#f8faff", "#ffffff"
-            RUN_BG, ACT_BG = "#e5f6ee", "#fff4da"
-        C_SUCCESS, C_WARNING, C_DANGER = SUCCESS, WARN, DANGER
+    # 调色板独立于 ttkbootstrap: 冻结 exe 里若 ttkbootstrap 导入失败(如缺少 PIL),
+    # 深色主题仍必须生效, 不能走硬编码浅色回退.
+    if theme == "dark":
+        BG, CARD, FG = "#11151c", "#1a202b", "#f3f6fb"
+        SIDEBAR, GRID, MENU_BG = "#0b0e13", "#2a3443", "#1d2430"
+        MUT = "#8d99aa"
+        ACCENT, ACCENT_DARK = "#788cff", "#5d70e6"
+        SUCCESS, WARN, DANGER = "#45d6a0", "#e5ad58", "#ef6f7b"
+        SEL, ODD, EVEN = "#293452", "#151b24", "#11151c"
+        RUN_BG, ACT_BG = "#173a35", "#3d3018"
     else:
+        BG, CARD, FG = "#f4f6fa", "#ffffff", "#202938"
+        SIDEBAR, GRID, MENU_BG = "#e9edf5", "#d9e0eb", "#ffffff"
+        MUT = "#657186"
+        ACCENT, ACCENT_DARK = "#5267d9", "#4053bd"
+        SUCCESS, WARN, DANGER = "#16805b", "#ae710e", "#c43f4b"
+        SEL, ODD, EVEN = "#e8edff", "#f8faff", "#ffffff"
+        RUN_BG, ACT_BG = "#e5f6ee", "#fff4da"
+    C_SUCCESS, C_WARNING, C_DANGER = SUCCESS, WARN, DANGER
+    if not HAS_TB:
         try:
             style.theme_use("clam")
         except tk.TclError:
@@ -364,10 +364,10 @@ def setup_style(app, theme=None):
         style.configure("TFrame", background=BG)
         style.configure("TLabel", background=BG, foreground=FG)
         style.configure("Muted.TLabel", background=BG, foreground=MUT)
-        style.configure("TButton", padding=(12, 6), background="#fbfcfe", foreground=FG,
-                        bordercolor="#c9d1da", relief="flat", focusthickness=0)
-        style.map("TButton", background=[("active", "#e8effc"), ("disabled", "#f0f1f3")],
-                  foreground=[("disabled", "#9aa3ad")])
+        style.configure("TButton", padding=(12, 6), background=CARD, foreground=FG,
+                        bordercolor=GRID, relief="flat", focusthickness=0)
+        style.map("TButton", background=[("active", SEL), ("disabled", ODD)],
+                  foreground=[("disabled", MUT)])
     for fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkIconFont",
                   "TkTooltipFont", "TkCaptionFont", "TkSmallCaptionFont"):
         _f(fname, size=10)
@@ -602,6 +602,7 @@ class SessionsTab(Fr):
         mkbtn(bar, "进入会话", self.open_session, "primary").pack(side="left", padx=2)
         mkbtn(bar, "打开目录", self.reveal_dir).pack(side="left", padx=2)
         mkbtn(bar, "删除会话", self.delete_session, "danger").pack(side="left", padx=2)
+        self.toolbar = bar
         cols = ("status", "time", "msgs", "title", "dir")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
         for c, w, txt, st in (("status", 84, "状态", False), ("time", 124, "更新时间", False),
@@ -825,6 +826,8 @@ class SyncTab(Fr):
         row2.pack(fill="x", pady=(0, 4))
         mkbtn(row2, "本机收尾并等同步完成 (oc-out)", self.do_out).pack(side="left", padx=2)
         mkbtn(row2, "等待拉取并接管本机 (oc-in)", self.do_in, "primary").pack(side="left", padx=2)
+        self.toolbar = row
+        self.toolbar2 = row2
         L(self, text="切换助手: 同一时刻只在一台电脑活跃. 换机前在旧机点 [收尾], 到新机点 [接管].",
           foreground=MUT).pack(anchor="w")
         cols = ("label", "state", "need", "path", "paused")
@@ -1082,6 +1085,8 @@ class BrowseTab(Fr):
         quick.pack(fill="x", pady=2)
         for label, path in self.roots.items():
             mkbtn(quick, label, lambda p=path: self.goto(p)).pack(side="left", padx=3, pady=3)
+        self.toolbar = bar
+        self.toolbar2 = quick
         cols = ("name", "size", "mtime")
         self.tree = ttk.Treeview(self, columns=cols, show="headings")
         for c, w, txt, a, st in (("name", 420, "名称", "w", True), ("size", 80, "大小", "e", False),
@@ -1206,7 +1211,7 @@ class App(_AppBase):
             self.geometry(f"{w}x{h}+{px}+{py}")
         app_ref = self
         setup_style(self, self.theme_name)
-        self.minsize(860, 540)
+        self.minsize(820, 520)
         ico = _app_icon_path()
         try:
             if os.path.isfile(ico):
@@ -1309,29 +1314,29 @@ class App(_AppBase):
         self.after(600, self._remember_geometry)
 
     def _fit_window_to_content(self):
-        """Keep the original one-row toolbars, then size the window around them."""
+        """启动时只需保证工具栏一行完整可见; minsize 保持较小值, 窗口仍可自由缩小."""
         try:
             self.update_idletasks()
             sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-            pages = (self.tab_sessions, self.tab_sync, self.tab_browse)
-            required_width = max(page.winfo_reqwidth() for page in pages) + 232 + 32
-            required_height = max(page.winfo_reqheight() for page in pages) + 104 + 32
-            width = min(sw - 32, max(self.winfo_width(), required_width))
-            height = min(sh - 80, max(self.winfo_height(), required_height))
-            self.minsize(min(width, sw - 32), min(height, sh - 80))
-            if width != self.winfo_width() or height != self.winfo_height():
-                x = max(0, (sw - width) // 2)
-                y = max(0, (sh - height) // 2 - 20)
-                self.geometry(f"{width}x{height}+{x}+{y}")
+            need = 0
+            for page in (self.tab_sessions, self.tab_sync, self.tab_browse):
+                for attr in ("toolbar", "toolbar2"):
+                    t = getattr(page, attr, None)
+                    if t is not None:
+                        need = max(need, t.winfo_reqwidth())
+            target = min(sw - 32, need + 232 + 48)
+            if target > self.winfo_width():
+                x = max(0, (sw - target) // 2)
+                self.geometry(f"{target}x{self.winfo_height()}+{x}+{self.winfo_y()}")
+            self.minsize(820, 520)
             self._remember_geometry()
         except tk.TclError:
             pass
 
     def _apply_saved_geometry(self, saved, sw, sh):
         width, height, x, y = saved
-        width = max(860, min(width, sw - 32))
-        height = max(540, min(height, sh - 80))
+        width = max(820, min(width, sw - 32))
+        height = max(520, min(height, sh - 80))
         x = max(0, min(x, sw - width))
         y = max(0, min(y, sh - height))
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -1371,13 +1376,29 @@ class App(_AppBase):
         lbl.config(bg=_shift(SIDEBAR, 10) if enter else SIDEBAR)
 
     def toggle_theme(self):
-        """Persist the choice and recreate the process so every Tk widget changes theme consistently."""
+        """Persist the choice and restart the process so every Tk widget changes theme consistently."""
         save_theme("light" if self.theme_name == "dark" else "dark")
-        self.destroy()
+        self._relaunch()
+
+    def _relaunch(self):
+        # PyInstaller onefile 引导器靠 _PYI_*/_MEIPASS2 环境变量向子进程传递解压目录.
+        # 自重启时若原样继承, 新实例会跳过解压、复用旧进程正在被清理的 _MEI 临时目录,
+        # 随即在 Tcl 初始化时报 "Can't find a usable init.tcl". 重启前必须剥离.
+        for k in [k for k in os.environ if k == "_MEIPASS2" or k.startswith("_PYI_")]:
+            os.environ.pop(k, None)
         if _is_frozen():
-            os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+            args = [sys.executable] + sys.argv[1:]
         else:
-            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+            args = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+        # 无控制台进程里标准句柄无效, 必须显式 DEVNULL; os.execv 在
+        # onefile/无窗口 exe 上不可靠, 改用 Popen 新进程 + 销毁本进程.
+        try:
+            subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             close_fds=True, creationflags=CREATE_NO_WINDOW)
+            self.destroy()
+        except Exception:
+            os.execv(args[0], args)
 
     def _tick(self):
         sids = [r[0] for r in self.tab_sessions.rows]

@@ -15,16 +15,18 @@ try { python -c "import PyInstaller" 2>$null; if ($LASTEXITCODE -ne 0) { throw '
 catch { Write-Host '[i] 安装 pyinstaller...'; python -m pip install pyinstaller }
 
 # 打包: onefile 单文件, 无控制台, 内嵌 app.ico 作为 exe/任务栏图标, 并随包附带 app.ico 供运行时窗口使用
-# 排除运行时不需要的重依赖(numpy/PIL/pandas 等), 避免被间接钩子拖入导致体积膨胀
+# 注意: ttkbootstrap 硬依赖 Pillow(style/theme.py 等 from PIL import ...),
+#       不能排除 PIL, 否则冻结后 import ttkbootstrap 失败 -> HAS_TB=False -> 深色主题失效
+# 排除运行时确实不需要的重依赖(numpy/pandas/scipy/matplotlib/pygame), 避免体积膨胀
 python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name opencode-anywhere `
     --icon $icon `
     --add-data "$icon;." `
     --exclude-module numpy `
-    --exclude-module PIL `
     --exclude-module pandas `
     --exclude-module scipy `
     --exclude-module matplotlib `
+    --exclude-module pygame `
     --distpath (Join-Path $root 'dist') `
     --workpath (Join-Path $root 'build') `
     --specpath $root `

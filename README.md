@@ -93,7 +93,7 @@ ocp-gui
 # 首次需安装打包工具
 python -m pip install pyinstaller
 
-# 一键打包（会排除 numpy/PIL/pandas 等运行时不需要的依赖）
+# 一键打包（ttkbootstrap 依赖 Pillow，必须打入；只排除 numpy/pandas 等真正无用的重依赖）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-exe.ps1
 ```
 
