@@ -82,7 +82,7 @@ def launch(row):
     if not exe:
         sys.exit("[x] 找不到 opencode 可执行文件")
     if exe.endswith(".cmd"):
-        subprocess.call(f'"{exe}" --session {sid}', cwd=d, shell=True)
+        subprocess.call(["cmd", "/c", exe, "--session", sid], cwd=d)
     else:
         subprocess.call([exe, "--session", sid], cwd=d)
 

@@ -14,6 +14,83 @@
 - 浏览共享目录、打开文件和在资源管理器中定位
 - 在多台 Windows 电脑之间安全切换活跃工作机
 
+## 使用步骤
+
+### 第 1 步：A 机（第一台电脑）准备
+
+1. 按[环境要求](#环境要求)安装 Python、opencode、Syncthing 2.x、Git 和 `ttkbootstrap`
+2. 启动 Syncthing，确认托盘图标在运行
+3. 启动 GUI：
+
+   ```powershell
+   tools\ocp-gui.cmd
+   ```
+
+4. 此时 A 机已可正常使用：会话管理、目录浏览等功能立即生效
+
+### 第 2 步：B 机（第二台电脑）初始化
+
+1. 把整个 `tools` 文件夹复制到 B 机任意目录
+2. 在 B 机以**管理员**身份打开 PowerShell，进入 `tools` 目录后执行：
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\install-remote.ps1
+   ```
+
+   脚本会自动安装缺失的 Git/Node.js/Python/Syncthing、安装 `opencode-ai` 和 `ttkbootstrap`、初始化 Syncthing、创建三个同步目录、加桌面快捷方式并把 `tools` 加入 PATH
+
+   > 运行时脚本会要求粘贴 **A 机 Device ID**（可先在 A 机运行 `oc-status` 记下）。出于安全考虑脚本不再硬编码设备 ID，请勿把任何机器的 Device ID 提交到公开仓库
+3. **记下脚本最后输出的 B 机 Device ID**
+4. 回到 A 机，执行配对（把 B 机加入同步设备）：
+
+   ```powershell
+   oc-pair <B机DeviceID>
+   ```
+
+5. 若 B 机此前未自动完成配对确认，在 B 机 Syncthing Web 管理页（`https://127.0.0.1:8384`）接受 A 机的共享请求
+
+### 第 3 步：等待首次同步完成
+
+- 首次同步会传输全部会话数据库、配置和工作目录文件，视数据量可能需要几分钟到几小时
+- 两台电脑都可以用 `oc-status` 或 GUI「共享同步」页查看各目录状态，直到三个目录均显示 `idle` 且待传为 0
+- **注意**：两台电脑的项目路径必须一致（例如都是 `D:\PythonProjects\claudeproject`），否则会话无法在 B 机续接
+
+### 第 4 步：日常换机流程
+
+每次在两台电脑之间切换工作时，严格按以下顺序：
+
+1. **旧机收尾**：退出旧电脑上全部 opencode 窗口，然后执行：
+
+   ```powershell
+   oc-out
+   ```
+
+   它会合并数据库 WAL、标记本机已收工、等待 Syncthing 传完（GUI 中对应「共享同步」页的「本机收尾」按钮）。之后旧机可以关机
+
+2. **新机接管**：在新电脑上执行：
+
+   ```powershell
+   oc-in
+   ```
+
+   它会等待 Syncthing 拉取完成、确认旧机已退出、把本机标记为活跃机器
+
+3. **继续工作**：
+
+   ```powershell
+   ocp-gui
+   ```
+
+   在会话管理页选中历史会话点「进入会话」，即可在原工作目录续接之前的对话
+
+> 核心原则：**同一时间只在一台电脑上使用 opencode**。两台同时写会话数据库会产生冲突文件。
+
+### 第 5 步（可选）：日常维护
+
+- `oc-status`：随时查看 Syncthing 连接设备和各目录待传量
+- GUI「共享同步」页：手动扫描、暂停/恢复目录、编辑 `.stignore`
+- 修改 `tools\ocp-gui.py` 后，运行 `tools\build-exe.ps1` 重新打包更新 EXE
+
 ## 目录结构
 
 ```text

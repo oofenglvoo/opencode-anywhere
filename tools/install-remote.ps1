@@ -6,7 +6,10 @@
         -> 工具脚本进 PATH(若项目已同步则直接用项目内 tools) -> 输出 B 机 DeviceID 供在 A 机跑 oc-pair
 #>
 $ErrorActionPreference = 'Stop'
-$A_DEVICE_ID = '45OYR3E-4TU7ZIP-NF6U4M4-DTJKNVO-RHTDPKC-7FSFEYV-QYNSCFX-QO2OKAE'
+# A 机 Device ID 不再硬编码(避免公开仓库泄露设备指纹), 运行时从 A 机获取后粘贴.
+# 获取方式: 在 A 机运行 oc-status, 或打开 A 机 Syncthing 管理页(操作 -> 显示 ID).
+$A_DEVICE_ID = (Read-Host '请输入 A 机 Device ID (在 A 机运行 oc-status 可查看)').Trim()
+if ($A_DEVICE_ID -notmatch '^[A-Z2-7]{7}(-[A-Z2-7]{7}){7}$') { throw "Device ID 格式不正确: $A_DEVICE_ID" }
 $A_NAME      = 'DESKTOP-A (opencode主)'
 
 function Say($m, $c = 'Cyan')   { Write-Host $m -ForegroundColor $c }
