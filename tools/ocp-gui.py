@@ -13,6 +13,7 @@ Tab3 目录浏览: 浏览共享目录内容, 高亮同步冲突/临时文件.
 import datetime as dt
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -271,10 +272,25 @@ def repo_prepare(url, token):
             msg = _with_hint(e)
             _err_remember(msg)
             raise RuntimeError(msg)
+    # 工作区可能之前就克隆好了, 而 remote.origin.url 是"克隆那一次"写进去的带令牌地址.
+    # 换过 PAT 之后必须重写: 幂等地直接返回会让 fetch/push 一直用旧令牌, 报
+    # "remote: Invalid username or token"(换 PAT 后所有同步都失败的原因).
+    _git(["remote", "set-url", "origin", _auth_url(url, token)])
     _git(["config", "user.name", "opencode-sync"])
     _git(["config", "user.email", "opencode-sync@local"])
     _err_remember("")
     return url
+
+
+def fetch_remote():
+    """fetch origin; 失败时记住原因并附中文提示(让[同步工作区]那行反映真实理由)."""
+    try:
+        _git(["fetch", "origin"])
+    except RuntimeError as e:
+        msg = _with_hint(e)
+        _err_remember(msg)
+        raise RuntimeError(msg)
+    _err_remember("")
 
 
 def _head_branch():
@@ -413,6 +429,18 @@ def read_bundle_manifest(path):
         return {}
 
 
+def bundle_flags(bundle, host=None):
+    """会话包的显示标记.
+
+    new = 含本机缺少的会话(值得并入); own = 本机自己传的包; old = 本机已全部拥有.
+    本机上传的包其会话必然都在本地, 所以 [本机缺] 恒为 0(不是算错).
+    """
+    host = os.environ.get("COMPUTERNAME", "?") if host is None else host
+    if int(bundle.get("new") or 0) > 0:
+        return "new"
+    return "own" if (bundle.get("host") or "") == host else "old"
+
+
 def _copy_from_bundle(con, alias, table, sid):
     """把会话包 alias 中某会话在 table 里的行并入本地(表结构取两边列名交集)."""
     lcols = _table_cols(con, table)
@@ -483,7 +511,7 @@ def sync_push_sessions(host, root_ids):
     cfg = load_sync_cfg()
     url = repo_prepare(cfg.get("repo_url"), cfg.get("token"))
     branch = _head_branch()
-    _git(["fetch", "origin"])
+    fetch_remote()
     if _remote_rev(branch):
         _git(["reset", "--hard", "origin/" + branch])
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -505,7 +533,7 @@ def sync_push_sessions(host, root_ids):
         try:
             _git(["push", auth, branch])
         except RuntimeError:
-            _git(["fetch", "origin"])
+            fetch_remote()
             _git(["rebase", "origin/" + branch], check=False)
             _git(["push", auth, branch])
     except RuntimeError as e:
@@ -522,7 +550,7 @@ def sync_remote():
     cfg = load_sync_cfg()
     url = repo_prepare(cfg.get("repo_url"), cfg.get("token"))
     branch = _head_branch()
-    _git(["fetch", "origin"])
+    fetch_remote()
     out = {"commit": None, "repo_mb": remote_repo_mb(url, cfg.get("token")), "bundles": []}
     if _remote_rev(branch):
         out["commit"] = _git(["log", "-1", "--date=iso",
@@ -995,16 +1023,51 @@ def _app_icon_path():
     return os.path.join(base, "app.ico")
 
 
+_BG_RESULTS = queue.Queue()
+
+
 def run_bg(fn, on_ok=None, on_err=None):
+    """子线程跑 fn, 结果交回主线程处理.
+
+    子线程不直接碰 Tk: 只把 (回调, 结果) 放进队列, 由主线程的 _bg_poll 取出执行.
+    这样避开 Tk 的跨线程调用, 也避开 "except ... as e 结束后 e 被删除" 的闭包坑:
+    旧写法 app_ref.after(0, lambda: on_err(e)) 里取 e 会抛 NameError, 异常被 Tk
+    静默吞掉 -> 失败既不弹窗也不改文字, 界面就永远停在"正在...中".
+    """
     def wrap():
         try:
             r = fn()
-            if on_ok and app_ref:
-                app_ref.after(0, lambda: on_ok(r))
-        except Exception as e:
-            if app_ref:
-                app_ref.after(0, lambda: (on_err(e) if on_err else messagebox.showerror("错误", str(e))))
+        except Exception as exc:
+            _BG_RESULTS.put((on_err, exc))
+        else:
+            _BG_RESULTS.put((on_ok, r))
     threading.Thread(target=wrap, daemon=True).start()
+
+
+def _bg_drain(on_default_error):
+    """取空队列里已完成的子线程结果, 逐个回调; 返回处理条数(无 Tk 依赖, 便于自检)."""
+    n = 0
+    while True:
+        try:
+            cb, payload = _BG_RESULTS.get_nowait()
+        except queue.Empty:
+            return n
+        n += 1
+        try:
+            if cb is None:
+                if isinstance(payload, BaseException):
+                    on_default_error(payload)
+            else:
+                cb(payload)
+        except Exception as exc:
+            on_default_error(exc)
+
+
+def _bg_poll():
+    """主线程轮询子线程结果(约 8 次/秒)."""
+    _bg_drain(lambda e: Msg.error("错误", str(e)))
+    if app_ref is not None:
+        app_ref.after(120, _bg_poll)
 
 
 # ---------------- 会话活跃度检测 ----------------
@@ -1395,7 +1458,8 @@ class SyncTab(Fr):
         L(self, text="上传: 到[会话管理]勾选会话, 点[上传所选会话]导出成独立会话包推送(可多次增量上传).\n"
                      "下载: 点[刷新远端会话包], 选中要并入的包, 再点[下载并并入所选]; "
                      "包内会话会以包内版本覆盖本机同名会话, 其它会话不受影响.\n"
-                     "项目代码请照常用 Git 手动同步; 私库请确保仅自己可见.",
+                     "[本机缺] = 该包里本机还没有的会话数, 0 表示本机已全部拥有(无需并入); "
+                     "本机自己传的包恒为 0. 项目代码请照常用 Git 手动同步; 私库请确保仅自己可见.",
           foreground=MUT, justify="left").pack(anchor="w")
         cols = ("item", "value", "note")
         self.stats = ttk.Treeview(self, columns=cols, show="headings", height=7, selectmode="none")
@@ -1405,16 +1469,33 @@ class SyncTab(Fr):
             self.stats.column(c, width=w, anchor=a, minwidth=90)
         self.stats.tag_configure("odd", background=ODD)
         self.stats.tag_configure("even", background=EVEN)
-        L(self, text="远端会话包(可多选):").pack(anchor="w", pady=(6, 0))
+        lblrow = Fr(self)
+        lblrow.pack(fill="x", pady=(6, 0))
+        L(lblrow, text="远端会话包(可多选):").pack(side="left")
+        self.only_new = tk.BooleanVar(value=False)
+        if HAS_TB:
+            self.onlychk = tb.Checkbutton(lblrow, text="只看本机缺的包", variable=self.only_new,
+                                          command=self._draw_remote, bootstyle="round-toggle")
+        else:
+            self.onlychk = tk.Checkbutton(lblrow, text="只看本机缺的包", variable=self.only_new,
+                                          command=self._draw_remote, bg=BG, fg=MUT,
+                                          activebackground=BG, activeforeground=FG,
+                                          selectcolor=CARD, highlightthickness=0, bd=0,
+                                          font=(UI_FONT, 9))
+        self.onlychk.pack(side="left", padx=(12, 0))
         cols2 = ("time", "host", "count", "size", "new", "file")
         self.tree = ttk.Treeview(self, columns=cols2, show="headings", selectmode="extended")
         for c, w, txt, a in (("time", 140, "上传时间", "w"), ("host", 110, "来源机器", "w"),
-                             ("count", 60, "会话", "w"), ("size", 90, "包大小", "w"),
-                             ("new", 90, "本机缺", "w"), ("file", 240, "会话包", "w")):
+                             ("count", 60, "会话数", "w"), ("size", 90, "包大小", "w"),
+                             ("new", 70, "本机缺", "w"), ("file", 250, "会话包", "w")):
             self.tree.heading(c, text=txt)
             self.tree.column(c, width=w, anchor=a, minwidth=58)
         self.tree.tag_configure("odd", background=ODD)
         self.tree.tag_configure("even", background=EVEN)
+        # 只有前景色不同, 背景仍由 odd/even 提供(排后面的 tag 只覆盖自己声明的选项)
+        self.tree.tag_configure("new", foreground=SUCCESS)
+        self.tree.tag_configure("own", foreground=MUT)
+        self.tree.tag_configure("old", foreground=MUT)
         self.progress = L(self, text="")
         self.progress.pack(side="bottom", fill="x")
         self.stats.pack(fill="x", pady=(4, 0))
@@ -1454,7 +1535,9 @@ class SyncTab(Fr):
         if not url_cfg:
             rows.append(("同步工作区", "未配置", "先在上面填私库地址和 PAT, 再点[保存并准备仓库]"))
         elif repo_ready():
-            rows.append(("同步工作区", "就绪", SYNC_WORKDIR))
+            last = sync_last_error()
+            rows.append(("同步工作区", "就绪(上次失败)" if last else "就绪",
+                         last.replace("\n", "  ") if last else SYNC_WORKDIR))
         else:
             last = sync_last_error()
             rows.append(("同步工作区", "未准备",
@@ -1527,17 +1610,29 @@ class SyncTab(Fr):
         self.progress.config(text="")
         self._remote = r
         self._bundles = r.get("bundles") or []
-        t = self.tree
-        t.delete(*t.get_children())
-        for i, b in enumerate(self._bundles):
-            t.insert("", "end", iid=b["file"], tags=("odd",) if i % 2 else ("even",),
-                     values=(b["time"], b["host"], b["count"], human_size(b["size"]),
-                             f"{b['new']}/{b['count']}", b["file"]))
+        self._draw_remote()
         self._render()
         if not self._bundles:
             self.progress.config(text="远端还没有会话包, 请先在另一台电脑上传所选会话")
-        else:
-            self.progress.config(text=f"远端共 {len(self._bundles)} 个会话包")
+
+    def _draw_remote(self):
+        """按[只看本机缺的包]过滤后重画远端列表."""
+        t = self.tree
+        t.delete(*t.get_children())
+        host = os.environ.get("COMPUTERNAME", "?")
+        shown = [b for b in self._bundles if not self.only_new.get() or b["new"] > 0]
+        for i, b in enumerate(shown):
+            t.insert("", "end", iid=b["file"], tags=("odd" if i % 2 else "even", bundle_flags(b, host)),
+                     values=(b["time"], b["host"], b["count"], human_size(b["size"]),
+                             b["new"], b["file"]))
+        if not self._bundles:
+            self.progress.config(text="")
+            return
+        miss = sum(1 for b in self._bundles if b["new"] > 0)
+        hidden = len(self._bundles) - len(shown)
+        self.progress.config(
+            text=f"远端共 {len(self._bundles)} 个会话包, 其中 {miss} 个含本机缺少的会话"
+                 + (f"; 已按[只看本机缺的包]隐藏 {hidden} 个" if hidden else ""))
 
     # ---------- 压缩数据库 ----------
 
@@ -1581,12 +1676,21 @@ class SyncTab(Fr):
                            for b in picks[:6])
         more = f"\n  ... 共 {len(picks)} 个包" if len(picks) > 6 else ""
         dirs = sorted({d for b in picks for d in b["dirs"]})
-        if not Msg.askyesno("下载并并入",
-                            f"将并入 {len(picks)} 个会话包, 共 {n} 个会话:\n{detail}{more}\n\n"
-                            f"其中 {over} 个本机已存在, 会被包内版本覆盖; 其它会话不受影响.\n"
-                            f"涉及目录: {', '.join(dirs[:3]) or '-'}"
-                            f"{' 等' if len(dirs) > 3 else ''}\n"
-                            "项目代码请自行在对应目录 clone/pull. 继续?"):
+        if over == n and n:
+            miss = sum(b["new"] for b in picks)
+            if not Msg.askyesno(
+                    "无需并入",
+                    f"选中的 {len(picks)} 个包共 {n} 个会话, 本机都已存在(缺 {miss} 个).\n\n"
+                    "并入只会用包内版本覆盖本机同名会话, 不会新增任何会话.\n"
+                    "如果只是想拿到其它电脑上的新对话, 请选[本机缺]大于 0 的包.\n\n仍要并入?"):
+                return
+        elif not Msg.askyesno("下载并并入",
+                              f"将并入 {len(picks)} 个会话包, 共 {n} 个会话:\n{detail}{more}\n\n"
+                              f"其中 {over} 个本机已存在, 会被包内版本覆盖; "
+                              f"{n - over} 个是本机缺少的; 其它会话不受影响.\n"
+                              f"涉及目录: {', '.join(dirs[:3]) or '-'}"
+                              f"{' 等' if len(dirs) > 3 else ''}\n"
+                              "项目代码请自行在对应目录 clone/pull. 继续?"):
             return
         self.progress.config(text="正在并入会话包...")
         run_bg(lambda: sync_merge_bundles([b["path"] for b in picks]),
@@ -1765,6 +1869,7 @@ class App(_AppBase):
         # 会漂移, 必须在其之后再设置我们自己的应用标识.
         _set_app_identity()
         app_ref = self
+        self.after(120, _bg_poll)
         setup_style(self, self.theme_name)
         self.minsize(820, 520)
         try:
@@ -2144,6 +2249,34 @@ def selftest():
     assert sync_last_error() == "x"
     _err_remember("")
     print("   地址规范化/错误提示 OK")
+    print("== 8. 后台线程结果回传 ==")
+    got, ev = [], threading.Event()
+
+    def keep(e):
+        got.append(e)
+        ev.set()
+
+    run_bg(lambda: (_ for _ in ()).throw(RuntimeError("boom")), on_err=keep)
+    while not ev.wait(0.01):
+        _bg_drain(keep)
+    assert got and isinstance(got[0], RuntimeError), "后台异常没回传给 on_err!"
+    assert "boom" in str(got[0]), "回传的异常内容不对!"
+    ok, ev2 = [], threading.Event()
+    run_bg(lambda: "fine", on_ok=lambda r: (ok.append(r), ev2.set()))
+    while not ev2.wait(0.01):
+        _bg_drain(keep)
+    assert ok == ["fine"], "后台成功结果没回传给 on_ok!"
+    boom = []
+    _BG_RESULTS.put((None, RuntimeError("no on_err")))
+    assert _bg_drain(boom.append) == 1 and boom, "缺 on_err 时没有兜底回调!"
+    print(f"   异常/成功/兜底回调 OK ({got[0]!r})")
+    print("== 9. 会话包标记 ==")
+    me = os.environ.get("COMPUTERNAME", "?")
+    assert bundle_flags({"new": 2, "host": "OTHER-PC"}) == "new"
+    assert bundle_flags({"new": 0, "host": me}) == "own", "本机上传的包应标记为 own"
+    assert bundle_flags({"new": 0, "host": "OTHER-PC"}) == "old"
+    assert bundle_flags({"count": 3, "new": 0, "host": me}) == "own", "本机缺 0 不应算异常"
+    print("   标记 new/own/old OK")
     print("ALL PASS")
 
 
