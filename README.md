@@ -267,7 +267,7 @@ GUI 包含三个页面：
 - **务必使用私有仓库**：会话内容（提示词、代码片段、工具输出）会明文存储在 GitHub 私库中
 - 建议使用 fine-grained PAT，并严格限制到这一个仓库：`Repository access` 只勾该仓库，权限只需 `Contents: Read and write`（`Metadata: Read-only` 自带）。PAT 只保存在本机 `%USERPROFILE%\.local\share\opencode\ocp-sync.json`
 - 使用 HTTPS + PAT 时，点 **保存并准备仓库** 会先调用 GitHub API 预检权限，权限不足会在克隆前直接提示原因，并列出该 PAT 当前能看到的仓库
-- 也可以把 PAT 留空：此时走本机 git 凭据（如 Git Credential Manager 或 SSH），前提是这台机器已能访问该私库
+- 也可以把 PAT 留空：此时走本机 git 凭据（如 Git Credential Manager 或 SSH），前提是这台机器已能访问该私库；填了 PAT 则 GUI 把 PAT 直接写进 git 地址，不经过凭据管理器，也就不会弹登录框
 - 地址默认按 HTTPS 补全；若填 `git@...` 则走本机 git 凭据（SSH）
 - 仓库会随每次上传保留历史提交，体积持续增长；可在 GitHub 上定期清理历史或压缩仓库
 
@@ -368,6 +368,37 @@ python tools\ocp-gui.py smoke
 失败时会自动清理残留的空工作区（`%LOCALAPPDATA%\opencode-git-sync`），修正权限后直接再点一次 **保存并准备仓库** 即可，不需要手动删目录。
 
 如果只是想临时绕过 PAT，把 PAT 框清空再点保存，会走本机 git 凭据。
+
+### 推送时反复要求「选择登录方式」（通常是换过 PAT 之后）
+
+那是 **Git Credential Manager (GCM)** 的弹窗：它拿缓存里**旧的、已失效的凭据**去认证，被 GitHub 拒绝后就每次都重新问一遍。按下面处理：
+
+1. 先清掉失效的凭据（`oofenglvoo` 换成你的账号名，`x-access-token` 那条是 GUI 会话同步留下的，可一并清掉）：
+
+   ```powershell
+   "protocol=https`nhost=github.com`nusername=oofenglvoo`n`n" | git credential reject
+   git credential-manager github list          # 看还剩哪些
+   ```
+
+2. 重新登录一次，把有效凭据写回凭据管理器：
+
+   ```powershell
+   git credential-manager github login --browser --username oofenglvoo --force
+   ```
+
+   - 浏览器会打开一个 `http://127.0.0.1:<端口>` 的**本地回调页**，这是正常的；该页面只在登录命令**运行期间**有效，所以授权完成前别关命令行窗口
+   - 提示 `Account '...' already has credentials` 就是缺 `--force`
+   - 浏览器不方便时改用设备码，再把打印出来的码填到 https://github.com/login/device ：
+
+     ```powershell
+     git credential-manager github login --device --username oofenglvoo --force
+     ```
+
+3. 验证：到项目里 `git push`，不再弹窗即可。想不动仓库地验证，用 `git push --dry-run`（注意：分支已是最新时会走匿名读取、看不出认证问题）。
+
+凭据管理器里可以同时存在两条 github.com 记录：`oofenglvoo`（你浏览器登录的凭据，权限覆盖你全部仓库，供自己的项目推送使用）和 `x-access-token`（GUI 用会话同步 PAT 时留下的，只作用于会话同步私库）。
+
+另外，GUI 的 git 调用会**把 PAT 直接写进地址**，所以正常不会触发 GCM 弹窗；只有把 PAT 留空、回落到本机凭据时才可能弹。
 
 ### 上传失败
 
