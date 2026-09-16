@@ -18,8 +18,14 @@
 
 1. 按[环境要求](#环境要求)安装 Python、opencode、Git 和 `ttkbootstrap`
 2. 在 GitHub 建一个**私有**空仓库（例如 `opencode-sync`）
-3. 建一个 fine-grained PAT，只授权这一个仓库的 `Contents: Read and write`
-   （GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens）
+3. 建一个 fine-grained PAT，只授权这一个仓库（GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens）：
+
+   - **Repository access** → `Only select repositories` → 勾选刚才建的私库
+   - **Repository permissions** → `Contents` 设为 **Read and write**（上传必需）
+   - `Metadata` 为 **Read-only**，是 GitHub 强制自带的，不用改
+   - 其它权限（Actions、Issues、Pull requests…）都不用开
+
+   只给 `Contents: Read-only` 的话可以下载会话包，但上传会报 403
 4. 启动 GUI：
 
    ```powershell
@@ -182,7 +188,8 @@ GUI 包含三个页面：
 
 ### 会话同步
 
-- 配置 GitHub 私库地址（默认 HTTPS，填 `owner/repo` 会自动补全）+ PAT，一键 clone 到本地同步工作区
+- 配置 GitHub 私库地址（默认 HTTPS，填 `owner/repo` 会自动补全）+ PAT，一键 clone 到本地同步工作区；克隆前先用 GitHub API 预检权限，权限不足直接给出中文原因
+- 同步工作区状态一目了然：`就绪` / `未准备`（附上次失败原因）/ `未配置`
 - 本地库体积统计：库/WAL 大小、压缩后估算、会话/消息/数据块数量
 - **刷新远端会话包**：拉取远端列表（上传时间、来源机器、会话数、包大小、本机缺少数）
 - **下载并并入所选**：把选中会话包里的会话并入本地库；只覆盖同 ID 会话，其它会话不受影响
@@ -256,7 +263,9 @@ GUI 包含三个页面：
 ### 安全须知
 
 - **务必使用私有仓库**：会话内容（提示词、代码片段、工具输出）会明文存储在 GitHub 私库中
-- 建议使用 fine-grained PAT 并只授权这一个仓库；PAT 只保存在本机 `%USERPROFILE%\.local\share\opencode\ocp-sync.json`
+- 建议使用 fine-grained PAT，并严格限制到这一个仓库：`Repository access` 只勾该仓库，权限只需 `Contents: Read and write`（`Metadata: Read-only` 自带）。PAT 只保存在本机 `%USERPROFILE%\.local\share\opencode\ocp-sync.json`
+- 使用 HTTPS + PAT 时，点 **保存并准备仓库** 会先调用 GitHub API 预检权限，权限不足会在克隆前直接提示原因，并列出该 PAT 当前能看到的仓库
+- 也可以把 PAT 留空：此时走本机 git 凭据（如 Git Credential Manager 或 SSH），前提是这台机器已能访问该私库
 - 地址默认按 HTTPS 补全；若填 `git@...` 则走本机 git 凭据（SSH）
 - 仓库会随每次上传保留历史提交，体积持续增长；可在 GitHub 上定期清理历史或压缩仓库
 
@@ -312,6 +321,7 @@ python tools\ocp-gui.py selftest
 - 活跃会话检测
 - opencode 可执行文件检测
 - 会话包导出/并入往返（在真实 schema 的临时库上验证：子会话随包导出、按包覆盖同名会话、重复并入幂等、本地独有会话保留）
+- 私库地址规范化与错误提示（`owner/repo` 补全为 HTTPS、`git@` 识别、各类 git 报错转中文可执行提示）
 
 GUI 冒烟测试：
 
@@ -339,9 +349,28 @@ python tools\ocp-gui.py smoke
 4. 会话目录不存在时，需要先在 B 机把项目代码 clone/pull 到同一路径
 5. 是否启动的是项目 `tools` 目录中的 GUI
 
+### 保存并准备仓库失败
+
+先在「会话同步」页看 **同步工作区** 这一行，它会显示状态和上次失败原因：
+
+- `未配置`：还没填私库地址和 PAT，或没点过 **保存并准备仓库**
+- `未准备`：克隆没成功。常见提示与处理：
+
+| 提示 | 原因 | 处理 |
+| --- | --- | --- |
+| `PAT 访问不到 owner/repo (404)` | token 的 Repository access 没勾这个仓库、地址写错、或仓库不存在 | 到 token 设置页勾上该仓库（见[第 1 步](#第-1-步a-机第一台电脑准备)），或核对地址。提示里会列出该 PAT 当前能看到的仓库，可直接对比 |
+| `PAT 对 owner/repo 只有只读权限(403)` | `Contents` 给的是 Read-only | 改为 `Read and write` |
+| `PAT 无效或已过期(401)` | token 被吊销或过期 | 重新生成后粘贴 |
+| `git 需要交互式凭证但已禁用` | 无 PAT 且本机没有可用 git 凭据 | 改用 HTTPS+PAT，或先行配置 SSH/凭据管理器 |
+
+失败时会自动清理残留的空工作区（`%LOCALAPPDATA%\opencode-git-sync`），修正权限后直接再点一次 **保存并准备仓库** 即可，不需要手动删目录。
+
+如果只是想临时绕过 PAT，把 PAT 框清空再点保存，会走本机 git 凭据。
+
 ### 上传失败
 
 - 提示克隆/push 失败：检查网络、私库地址、PAT 权限（需要对该仓库 `Contents: Read and write`）
+- 提示 `未就绪`：说明私库还没准备好，按上一条处理；提示里会带上上次失败原因
 - 提示会话包体积超限：单个包压缩后超过 95MB。到「会话管理」按「大小」列找出大会话，减少勾选范围，或删除过大的旧会话后再上传
 - 看不到远端会话包：确认上传后点过 **刷新远端会话包**；远端为空说明还没成功上传过
 
