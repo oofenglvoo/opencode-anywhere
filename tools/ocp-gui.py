@@ -278,6 +278,8 @@ GRID = "#dfe3e8"
 MENU_BG = "#ffffff"
 RUN_BG = "#e0f5ea"
 ACT_BG = "#fdf2d9"
+RUN_FG = "#0d6b47"
+ACT_FG = "#8a5a08"
 C_SUCCESS = "#1a7f4e"
 C_WARNING = "#a86800"
 C_DANGER = "#b02b2b"
@@ -334,6 +336,7 @@ def save_window_geometry(width, height, x, y):
 def setup_style(app, theme=None):
     global BG, SIDEBAR, CARD, FG, MUT, ACCENT, ACCENT_DARK, SUCCESS, WARN, DANGER
     global SEL, ODD, EVEN, GRID, MENU_BG, RUN_BG, ACT_BG, C_SUCCESS, C_WARNING, C_DANGER
+    global RUN_FG, ACT_FG
     theme = theme or load_theme()
     style = tb.Style(theme="darkly" if theme == "dark" else "flatly") if HAS_TB else ttk.Style(app)
     # 调色板独立于 ttkbootstrap: 冻结 exe 里若 ttkbootstrap 导入失败(如缺少 PIL),
@@ -346,6 +349,7 @@ def setup_style(app, theme=None):
         SUCCESS, WARN, DANGER = "#45d6a0", "#e5ad58", "#ef6f7b"
         SEL, ODD, EVEN = "#293452", "#151b24", "#11151c"
         RUN_BG, ACT_BG = "#173a35", "#3d3018"
+        RUN_FG, ACT_FG = "#45d6a0", "#e5ad58"
     else:
         BG, CARD, FG = "#f4f6fa", "#ffffff", "#202938"
         SIDEBAR, GRID, MENU_BG = "#e9edf5", "#d9e0eb", "#ffffff"
@@ -353,7 +357,8 @@ def setup_style(app, theme=None):
         ACCENT, ACCENT_DARK = "#5267d9", "#4053bd"
         SUCCESS, WARN, DANGER = "#16805b", "#ae710e", "#c43f4b"
         SEL, ODD, EVEN = "#e8edff", "#f8faff", "#ffffff"
-        RUN_BG, ACT_BG = "#e5f6ee", "#fff4da"
+        RUN_BG, ACT_BG = "#c9ecd9", "#ffe7b8"
+        RUN_FG, ACT_FG = "#0d6b47", "#8a5a08"
     C_SUCCESS, C_WARNING, C_DANGER = SUCCESS, WARN, DANGER
     if not HAS_TB:
         try:
@@ -605,15 +610,16 @@ class SessionsTab(Fr):
         self.toolbar = bar
         cols = ("status", "time", "msgs", "title", "dir")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
-        for c, w, txt, st in (("status", 84, "状态", False), ("time", 124, "更新时间", False),
+        for c, w, txt, st in (("status", 96, "状态", False), ("time", 124, "更新时间", False),
                               ("msgs", 56, "消息", False), ("title", 320, "标题", True),
                               ("dir", 320, "目录", True)):
             self.tree.heading(c, text=txt)
             self.tree.column(c, width=w, anchor="w", stretch=st, minwidth=56 if not st else 160)
         self.tree.tag_configure("odd", background=ODD)
         self.tree.tag_configure("even", background=EVEN)
-        self.tree.tag_configure("run", background=RUN_BG)
-        self.tree.tag_configure("act", background=ACT_BG)
+        self.tree.tag_configure("run", background=RUN_BG, foreground=RUN_FG,
+                                font=(UI_FONT, 10, "bold"))
+        self.tree.tag_configure("act", background=ACT_BG, foreground=ACT_FG)
         vs = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vs.set)
         self.status = L(self)
@@ -685,8 +691,9 @@ class SessionsTab(Fr):
             tags = ("odd",) if n % 2 else ("even",)
             if kind != "idle":
                 tags += (kind,)
+            disp = f"● {txt}" if kind == "run" else txt
             t.insert("", "end", iid=r[0], tags=tags,
-                     values=(txt, human_time(r[3]), r[4],
+                     values=(disp, human_time(r[3]), r[4],
                              (r[1] or "").strip().replace("\n", " ")[:56], r[2]))
             n += 1
         for k in keep:
@@ -723,8 +730,9 @@ class SessionsTab(Fr):
                 continue
             txt, kind, _p = info
             vals = list(t.item(iid, "values"))
-            if vals[0] != txt:
-                vals[0] = txt
+            disp = f"● {txt}" if kind == "run" else txt
+            if vals[0] != disp:
+                vals[0] = disp
                 zebra = "odd" if i % 2 else "even"
                 t.item(iid, values=vals, tags=(zebra,) if kind == "idle" else (zebra, kind))
                 changed = True
@@ -837,7 +845,7 @@ class SyncTab(Fr):
                 ("state", 88, "状态", False, "center", 76),
                 ("need", 112, "待传", False, "center", 104),
                 ("path", 360, "路径", True, "w", 220),
-                ("paused", 56, "暂停", False, "center", 50)):
+                ("paused", 76, "暂停", False, "center", 64)):
             self.tree.heading(c, text=txt)
             self.tree.column(c, width=w, anchor=anchor, stretch=st, minwidth=minimum)
         self.tree.tag_configure("odd", background=ODD)
@@ -1190,7 +1198,6 @@ NAV_ITEMS = (("会话管理", "sessions"), ("共享同步", "sync"), ("目录浏
 class App(_AppBase):
     def __init__(self, tab=0):
         global app_ref
-        _set_app_identity()
         self.theme_name = load_theme()
         try:
             import ctypes
@@ -1201,20 +1208,28 @@ class App(_AppBase):
         w = min(1280, int(sw * 0.78))
         h = min(880, int(sh * 0.82))
         px, py = (sw - w) // 2, (sh - h) // 2 - 20
+        ico = _app_icon_path()
+        has_ico = os.path.isfile(ico)
         if HAS_TB:
+            # 必须显式传入 app.ico: tb.Window 默认 iconphoto='' 会在构造时应用
+            # ttkbootstrap 品牌图标, 覆盖窗口左上角的应用图标.
+            # iconphoto=None 表示"不动图标", 交给下面的 iconbitmap 兜底.
             super().__init__(title="opencode 会话与共享管理",
                              themename="darkly" if self.theme_name == "dark" else "flatly",
-                             size=(w, h), position=(px, py))
+                             size=(w, h), position=(px, py),
+                             iconphoto=ico if has_ico else None)
         else:
             super().__init__()
             self.title("opencode 会话与共享管理")
             self.geometry(f"{w}x{h}+{px}+{py}")
+        # tb.Window 构造中会把 AUMID 覆盖成 "ttkbootstrap.app", 任务栏分组/图标
+        # 会漂移, 必须在其之后再设置我们自己的应用标识.
+        _set_app_identity()
         app_ref = self
         setup_style(self, self.theme_name)
         self.minsize(820, 520)
-        ico = _app_icon_path()
         try:
-            if os.path.isfile(ico):
+            if has_ico:
                 self.iconbitmap(default=ico)
         except tk.TclError:
             pass
