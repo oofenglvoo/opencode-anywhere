@@ -114,10 +114,26 @@ def db_stats():
     return st
 
 
+SYNC_TOKEN = {"v": ""}
+
+
+def _git_prefix(token):
+    """有 PAT 时给 git 关掉凭据助手: 既不查也不存.
+
+    否则 git 会把地址里的 PAT 通过 credential approve 存进 Git Credential Manager,
+    于是 github.com 下多出个 x-access-token 账号, 之后你自己 push 时 GCM 会弹出
+    "选哪个账号"的窗口. 有 PAT 时我们每次都把 PAT 直接写进地址, 本就不需要助手.
+    """
+    if (token or "").strip():
+        return ["-c", "credential.helper=", "-c", "credential.interactive=false"]
+    return []
+
+
 def _git(args, check=True):
     env = child_env()
     env.update(_GIT_ENV)
-    r = subprocess.run(["git"] + args, cwd=SYNC_WORKDIR, capture_output=True,
+    cmd = ["git"] + _git_prefix(SYNC_TOKEN["v"]) + args
+    r = subprocess.run(cmd, cwd=SYNC_WORKDIR, capture_output=True,
                        timeout=900, creationflags=CREATE_NO_WINDOW, env=env)
     if check and r.returncode != 0:
         msg = (r.stderr or r.stdout).decode("utf-8", "replace").strip()
@@ -254,6 +270,7 @@ def repo_prepare(url, token):
     url = _normalize_url(url)
     if not url:
         raise RuntimeError("未配置私库地址")
+    SYNC_TOKEN["v"] = (token or "").strip()
     if not repo_ready():
         # 有 PAT 且是 HTTPS 时先做 API 预检, 让"权限不足"在克隆前就以中文说清楚
         if url.lower().startswith("https://") and (token or "").strip():
@@ -2277,6 +2294,11 @@ def selftest():
     assert bundle_flags({"new": 0, "host": "OTHER-PC"}) == "old"
     assert bundle_flags({"count": 3, "new": 0, "host": me}) == "own", "本机缺 0 不应算异常"
     print("   标记 new/own/old OK")
+    print("== 10. 有 PAT 时禁用凭据助手 ==")
+    assert _git_prefix("github_pat_xxx") == ["-c", "credential.helper=",
+                                             "-c", "credential.interactive=false"]
+    assert _git_prefix("") == [] and _git_prefix(None) == [] and _git_prefix("  ") == []
+    print("   凭据助手开关 OK")
     print("ALL PASS")
 
 
