@@ -76,6 +76,29 @@ pythonw tools\ocp-gui.py
 ocp-gui
 ```
 
+`tools\ocp-gui.cmd` 会优先启动已打包的 `dist\opencode-anywhere.exe`；若不存在则回退到 `pythonw tools\ocp-gui.py`。
+
+## 主题与窗口记忆
+
+- 页面右上角有 **☀ 浅色 / ☾ 深色** 切换按钮，点击后保存偏好并重启，全部控件（含原生 Tk、ttk、Treeview、侧栏、菜单）一起换色。
+- 主题偏好保存到 `%USERPROFILE%\.local\share\opencode\ocp-gui-theme.json`。
+- 程序退出/移动/缩放后，窗口尺寸与位置会记录到 `%USERPROFILE%\.local\share\opencode\ocp-gui-window.json`，下次启动自动恢复。
+- 启动后按各页面工具栏的实际所需宽度做一次自适应：若恢复的窗口过小，会自动扩大到能完整显示所有按钮（含“删除会话”和同步页“待传/暂停”列），并限制在屏幕范围内。
+
+## 打包为独立 EXE
+
+独立 exe 能最稳定地保证任务栏与窗口左上角显示应用图标（而不是 Python 图标）。
+
+```powershell
+# 首次需安装打包工具
+python -m pip install pyinstaller
+
+# 一键打包（会排除 numpy/PIL/pandas 等运行时不需要的依赖）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-exe.ps1
+```
+
+产物：`dist\opencode-anywhere.exe`（约 13MB，已内嵌 `tools\app.ico`）。`dist/`、`build/`、`*.spec` 已在 `.gitignore` 中忽略，不入库。修改 `tools\ocp-gui.py` 后重新运行该脚本即可更新 exe。
+
 GUI 包含三个页面：
 
 ### 会话管理

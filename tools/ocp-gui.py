@@ -281,6 +281,8 @@ ACT_BG = "#fdf2d9"
 C_SUCCESS = "#1a7f4e"
 C_WARNING = "#a86800"
 C_DANGER = "#b02b2b"
+THEME_FILE = os.path.join(DATA_DIR, "ocp-gui-theme.json")
+WINDOW_FILE = os.path.join(DATA_DIR, "ocp-gui-window.json")
 
 
 def _shift(hexcol, amt):
@@ -297,21 +299,61 @@ def _f(name, **kw):
         pass
 
 
-def setup_style(app):
+def load_theme():
+    try:
+        with open(THEME_FILE, encoding="utf-8") as f:
+            return "light" if json.load(f).get("theme") == "light" else "dark"
+    except (OSError, ValueError, TypeError):
+        return "dark"
+
+
+def save_theme(theme):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(THEME_FILE, "w", encoding="utf-8") as f:
+        json.dump({"theme": theme}, f)
+
+
+def load_window_geometry():
+    try:
+        with open(WINDOW_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return tuple(int(data[k]) for k in ("width", "height", "x", "y"))
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def save_window_geometry(width, height, x, y):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(WINDOW_FILE, "w", encoding="utf-8") as f:
+            json.dump({"width": width, "height": height, "x": x, "y": y}, f)
+    except OSError:
+        pass
+
+
+def setup_style(app, theme=None):
     global BG, SIDEBAR, CARD, FG, MUT, ACCENT, ACCENT_DARK, SUCCESS, WARN, DANGER
     global SEL, ODD, EVEN, GRID, MENU_BG, RUN_BG, ACT_BG, C_SUCCESS, C_WARNING, C_DANGER
-    style = tb.Style(theme="darkly") if HAS_TB else ttk.Style(app)
+    theme = theme or load_theme()
+    style = tb.Style(theme="darkly" if theme == "dark" else "flatly") if HAS_TB else ttk.Style(app)
     if HAS_TB:
         c = style.colors
-        # A quieter graphite canvas with a brighter indigo accent. The stock
-        # darkly blue is too low-contrast for a management dashboard.
-        BG, CARD, FG = "#11151c", "#1a202b", "#f3f6fb"
-        SIDEBAR, GRID, MENU_BG = "#0b0e13", "#2a3443", "#1d2430"
-        MUT = "#8d99aa"
-        ACCENT, ACCENT_DARK = "#788cff", "#5d70e6"
-        SUCCESS, WARN, DANGER = "#45d6a0", "#e5ad58", "#ef6f7b"
-        SEL, ODD, EVEN = "#293452", "#151b24", "#11151c"
-        RUN_BG, ACT_BG = "#173a35", "#3d3018"
+        if theme == "dark":
+            BG, CARD, FG = "#11151c", "#1a202b", "#f3f6fb"
+            SIDEBAR, GRID, MENU_BG = "#0b0e13", "#2a3443", "#1d2430"
+            MUT = "#8d99aa"
+            ACCENT, ACCENT_DARK = "#788cff", "#5d70e6"
+            SUCCESS, WARN, DANGER = "#45d6a0", "#e5ad58", "#ef6f7b"
+            SEL, ODD, EVEN = "#293452", "#151b24", "#11151c"
+            RUN_BG, ACT_BG = "#173a35", "#3d3018"
+        else:
+            BG, CARD, FG = "#f4f6fa", "#ffffff", "#202938"
+            SIDEBAR, GRID, MENU_BG = "#e9edf5", "#d9e0eb", "#ffffff"
+            MUT = "#657186"
+            ACCENT, ACCENT_DARK = "#5267d9", "#4053bd"
+            SUCCESS, WARN, DANGER = "#16805b", "#ae710e", "#c43f4b"
+            SEL, ODD, EVEN = "#e8edff", "#f8faff", "#ffffff"
+            RUN_BG, ACT_BG = "#e5f6ee", "#fff4da"
         C_SUCCESS, C_WARNING, C_DANGER = SUCCESS, WARN, DANGER
     else:
         try:
@@ -425,17 +467,31 @@ def _menu_colors():
     return dict(bg=MENU_BG, fg=FG, activebackground=SEL, activeforeground=FG, borderwidth=1)
 
 
+def _is_frozen():
+    return getattr(sys, "frozen", False)
+
+
 def _set_app_identity():
     """脱离 pythonw 默认分组, 让任务栏显示窗口自己的图标而不是 Python 图标."""
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("opencode.ocp-gui")
+        # 冻结成 exe 后, 主程序图标已由 PyInstaller 注入; AUMID 与可执行文件绑定,
+        # 保证任务栏分组稳定, 不会因为改名/换目录而漂回 Python 图标.
+        if _is_frozen():
+            appid = "opencode.anywhere.exe"
+        else:
+            appid = "opencode.ocp-gui"
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
     except Exception:
         pass
 
 
 def _app_icon_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico")
+    if _is_frozen():
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "app.ico")
 
 
 def run_bg(fn, on_ok=None, on_err=None):
@@ -773,15 +829,21 @@ class SyncTab(Fr):
           foreground=MUT).pack(anchor="w")
         cols = ("label", "state", "need", "path", "paused")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
-        for c, w, txt, st in (("label", 170, "目录", False), ("state", 88, "状态", False),
-                              ("need", 96, "待传", False), ("path", 330, "路径", True),
-                              ("paused", 48, "暂停", False)):
+        for c, w, txt, st, anchor, minimum in (
+                ("label", 170, "目录", False, "w", 130),
+                ("state", 88, "状态", False, "center", 76),
+                ("need", 112, "待传", False, "center", 104),
+                ("path", 360, "路径", True, "w", 220),
+                ("paused", 56, "暂停", False, "center", 50)):
             self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, anchor="w", stretch=st, minwidth=44 if not st else 160)
+            self.tree.column(c, width=w, anchor=anchor, stretch=st, minwidth=minimum)
         self.tree.tag_configure("odd", background=ODD)
         self.tree.tag_configure("even", background=EVEN)
         self.progress = L(self, text="")
         self.progress.pack(side="bottom", fill="x")
+        self.hscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(xscrollcommand=self.hscroll.set)
+        self.hscroll.pack(side="bottom", fill="x", pady=(0, 4))
         self.tree.pack(fill="both", expand=True, pady=4)
         self.poll_job = None
         self.summary = "连接中..."
@@ -1124,24 +1186,27 @@ class App(_AppBase):
     def __init__(self, tab=0):
         global app_ref
         _set_app_identity()
+        self.theme_name = load_theme()
         try:
             import ctypes
             user32 = ctypes.windll.user32
             sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
         except Exception:
             sw, sh = 1920, 1080
-        w, h = min(1280, int(sw * 0.78)), min(880, int(sh * 0.82))
+        w = min(1280, int(sw * 0.78))
+        h = min(880, int(sh * 0.82))
         px, py = (sw - w) // 2, (sh - h) // 2 - 20
         if HAS_TB:
-            super().__init__(title="opencode 会话与共享管理", themename="darkly",
+            super().__init__(title="opencode 会话与共享管理",
+                             themename="darkly" if self.theme_name == "dark" else "flatly",
                              size=(w, h), position=(px, py))
         else:
             super().__init__()
             self.title("opencode 会话与共享管理")
             self.geometry(f"{w}x{h}+{px}+{py}")
         app_ref = self
-        setup_style(self)
-        self.minsize(900, 540)
+        setup_style(self, self.theme_name)
+        self.minsize(860, 540)
         ico = _app_icon_path()
         try:
             if os.path.isfile(ico):
@@ -1208,6 +1273,13 @@ class App(_AppBase):
         self.page_subtitle = tk.Label(self.page_header, text="", bg=BG, fg=MUT,
                                       font=(UI_FONT, 9))
         self.page_subtitle.pack(anchor="w", padx=25, pady=(2, 0))
+        self.theme_button = tk.Button(header_line,
+                                      text="☀ 浅色" if self.theme_name == "dark" else "☾ 深色",
+                                      command=self.toggle_theme, bg=CARD, fg=MUT,
+                                      activebackground=SEL, activeforeground=FG,
+                                      relief="flat", bd=0, padx=10, pady=5,
+                                      font=(UI_FONT, 9), cursor="hand2")
+        self.theme_button.pack(side="right", padx=(0, 10), pady=3)
         tk.Frame(content, bg=GRID, height=1).grid(row=0, column=0, sticky="sew")
         page_host = tk.Frame(content, bg=BG)
         page_host.grid(row=1, column=0, sticky="nsew")
@@ -1228,6 +1300,53 @@ class App(_AppBase):
         self.show(keys[tab] if 0 <= tab < len(keys) else "sessions")
         self.bind("<F5>", lambda e: self.tab_sessions.load())
         self._nav_job = self.after(6000, self._tick)
+        self._geometry_job = None
+        self._last_geometry = None
+        saved = load_window_geometry()
+        if saved:
+            self._apply_saved_geometry(saved, sw, sh)
+        self.after(180, self._fit_window_to_content)
+        self.after(600, self._remember_geometry)
+
+    def _fit_window_to_content(self):
+        """Keep the original one-row toolbars, then size the window around them."""
+        try:
+            self.update_idletasks()
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            pages = (self.tab_sessions, self.tab_sync, self.tab_browse)
+            required_width = max(page.winfo_reqwidth() for page in pages) + 232 + 32
+            required_height = max(page.winfo_reqheight() for page in pages) + 104 + 32
+            width = min(sw - 32, max(self.winfo_width(), required_width))
+            height = min(sh - 80, max(self.winfo_height(), required_height))
+            self.minsize(min(width, sw - 32), min(height, sh - 80))
+            if width != self.winfo_width() or height != self.winfo_height():
+                x = max(0, (sw - width) // 2)
+                y = max(0, (sh - height) // 2 - 20)
+                self.geometry(f"{width}x{height}+{x}+{y}")
+            self._remember_geometry()
+        except tk.TclError:
+            pass
+
+    def _apply_saved_geometry(self, saved, sw, sh):
+        width, height, x, y = saved
+        width = max(860, min(width, sw - 32))
+        height = max(540, min(height, sh - 80))
+        x = max(0, min(x, sw - width))
+        y = max(0, min(y, sh - height))
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _remember_geometry(self):
+        try:
+            if self.state() == "normal":
+                current = (self.winfo_width(), self.winfo_height(),
+                           self.winfo_x(), self.winfo_y())
+                if current != self._last_geometry:
+                    self._last_geometry = current
+                    save_window_geometry(*current)
+            self._geometry_job = self.after(1000, self._remember_geometry)
+        except tk.TclError:
+            pass
 
     def show(self, key):
         if self._cur:
@@ -1250,6 +1369,15 @@ class App(_AppBase):
         if key == self._cur:
             return
         lbl.config(bg=_shift(SIDEBAR, 10) if enter else SIDEBAR)
+
+    def toggle_theme(self):
+        """Persist the choice and recreate the process so every Tk widget changes theme consistently."""
+        save_theme("light" if self.theme_name == "dark" else "dark")
+        self.destroy()
+        if _is_frozen():
+            os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+        else:
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
 
     def _tick(self):
         sids = [r[0] for r in self.tab_sessions.rows]

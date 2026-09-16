@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# PyInstaller 构建产物 (体积大, 不入库; 用 tools/build-exe.ps1 本地重建)
+dist/
+build/
+*.spec
