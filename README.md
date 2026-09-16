@@ -396,9 +396,14 @@ python tools\ocp-gui.py smoke
 
 3. 验证：到项目里 `git push`，不再弹窗即可。想不动仓库地验证，用 `git push --dry-run`（注意：分支已是最新时会走匿名读取、看不出认证问题）。
 
-凭据管理器里可以同时存在两条 github.com 记录：`oofenglvoo`（你浏览器登录的凭据，权限覆盖你全部仓库，供自己的项目推送使用）和 `x-access-token`（GUI 用会话同步 PAT 时留下的，只作用于会话同步私库）。
+凭据管理器里如果同时存在两条 github.com 记录（例如 `oofenglvoo` 和 `x-access-token`），GCM 每次都会弹窗让你选**用哪个账号**。`x-access-token` 是 git 把地址里的 PAT 通过 `credential approve` 存进凭据管理器留下的（旧版本会这样），清掉它即可：
 
-另外，GUI 的 git 调用会**把 PAT 直接写进地址**，所以正常不会触发 GCM 弹窗；只有把 PAT 留空、回落到本机凭据时才可能弹。
+```powershell
+"protocol=https`nhost=github.com`nusername=x-access-token`n`n" | git credential reject
+git credential-manager github list        # 确认只剩 oofenglvoo
+```
+
+现在 GUI 在有 PAT 时会用 `-c credential.helper=` 调 git，**既不查也不存**凭据管理器，所以不会再自动攒出这种记录；只有把 PAT 留空、回落到本机凭据时才可能弹。
 
 ### 上传失败
 
