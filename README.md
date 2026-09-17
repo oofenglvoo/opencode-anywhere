@@ -14,25 +14,30 @@
 
 ## 使用步骤
 
-### 第 1 步：A 机（第一台电脑）准备
+### 1. 准备（每台电脑一次）
 
-1. 按[环境要求](#环境要求)安装 Python、opencode、Git 和 `ttkbootstrap`
-2. 在 GitHub 建一个**私有**空仓库（例如 `opencode-sync`）
-3. 建一个 fine-grained PAT，只授权这一个仓库（GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens）：
+需要 **opencode**（会话本体）、**Git**（会话包同步）、一个 **GitHub 私有仓库**。
+全新机器可用脚本把缺的组件（含 opencode 依赖的 Node.js）一次装齐，以**管理员**身份打开
+PowerShell，进入 `tools` 目录后执行：
 
-   - **Repository access** → `Only select repositories` → 勾选刚才建的私库
-   - **Repository permissions** → `Contents` 设为 **Read and write**（上传必需）
-   - `Metadata` 为 **Read-only**，是 GitHub 强制自带的，不用改
-   - 其它权限（Actions、Issues、Pull requests…）都不用开
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-remote.ps1
+```
 
-   只给 `Contents: Read-only` 的话可以下载会话包，但上传会报 403
-4. 启动 GUI：
+然后在 GitHub 建一个**私有**空仓库（例如 `opencode-sync`），并建一个 fine-grained PAT
+（GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens）：
 
-   ```powershell
-   tools\ocp-gui.cmd
-   ```
+- **Repository access** → `Only select repositories` → 勾选该私库
+- **Repository permissions** → `Contents` 设为 **Read and write**（上传必需）
+- `Metadata` 为 **Read-only**，是 GitHub 强制自带的，不用改
+- 其它权限（Actions、Issues、Pull requests…）都不用开
 
-5. 进入「会话同步」页，填入私库地址和 PAT，点 **保存并准备仓库**
+只给 `Contents: Read-only` 的话可以下载会话包，但上传会报 403。
+
+### 2. 配置同步（每台电脑一次）
+
+1. 启动 GUI（见[启动 GUI](#启动-gui)）
+2. 进入「会话同步」页，填入私库地址和 PAT，点 **保存并准备仓库**
 
    地址默认按 **HTTPS** 方式访问，以下写法都可以，会自动补全为 `https://github.com/...`：
 
@@ -44,29 +49,12 @@
 
    （如需走 SSH，直接填 `git@github.com:you/opencode-sync.git`，此时 PAT 可留空。）
 
-6. 填入后 A 机即可正常使用：会话管理、目录浏览等功能立即生效
+3. 每台电脑都填**同一个**私库地址和 PAT
+4. 首次使用 opencode 时自行登录 opencode（会话包只含会话数据，不含登录凭据）
 
-### 第 2 步：B 机（第二台电脑）环境安装
+### 3. 日常同步流程
 
-1. 把整个 `tools` 文件夹复制到 B 机任意目录
-2. 在 B 机以**管理员**身份打开 PowerShell，进入 `tools` 目录后执行：
-
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File .\install-remote.ps1
-   ```
-
-   脚本只负责**装环境**：安装缺失的 Git/Node.js/Python、安装 `opencode-ai` 和 `ttkbootstrap`、加桌面快捷方式、把 `tools` 加入 PATH。会话同步全部在 GUI 里完成
-
-3. 首次在 B 机使用 opencode 时，请自行登录 opencode（会话包只含会话数据，不含登录凭据）
-
-### 第 3 步：B 机配置同步
-
-1. 打开 B 机 GUI（`ocp-gui`），进入「会话同步」页
-2. 填入**同一个**私库地址和 PAT，点 **保存并准备仓库**
-
-### 第 4 步：日常同步流程
-
-方向 A（A 机 → B 机）：
+以「A 机 → B 机」为例：
 
 1. **A 机上传**：到「会话管理」勾选要同步的会话（可多选，支持搜索/筛选后全选），点 **上传所选会话**
 
@@ -87,7 +75,7 @@
 >
 > **注意**：两台电脑的项目路径最好一致（例如都是 `D:\PythonProjects\claudeproject`），否则会话在另一台续接时要先到对应目录把项目代码 clone/pull 回来。
 
-### 第 5 步（可选）：日常维护
+### 4. 日常维护（可选）
 
 - **刷新远端会话包**：查看远端有哪些会话包、是否已有同名会话
 - **刷新统计**：本地库体积、WAL、压缩后估算、会话/消息/数据块数量
@@ -108,29 +96,26 @@ opencode会话和文件同步/
    ├─ ocp-gui.cmd         # GUI 启动器
    ├─ ocp.py              # 终端会话选择器
    ├─ ocp.cmd
-   └─ install-remote.ps1  # B 机环境安装
+   ├─ install-remote.ps1  # 新机器一键装环境
+   └─ build-exe.ps1       # 打包独立 EXE
 ```
 
 ## 环境要求
 
 - Windows 10/11
-- Python 3.10 或更高版本（仅开发机需要；打包后的 EXE 自带运行时）
 - opencode
-- Git（会话同步与 opencode 的部分撤销/恢复能力都依赖 Git）
-- Python 包：`ttkbootstrap`
-- 一个 GitHub 私库（同步会话包）
+- Git（会话包同步依赖）
+- 一个 GitHub 私有仓库（存放会话包）
 
-安装 Python 依赖：
+以上组件缺哪补哪即可，`tools\install-remote.ps1` 会一次装齐（含 opencode 依赖的 Node.js）。
 
-```powershell
-python -m pip install ttkbootstrap
-```
-
-如果没有 Python，可以先使用官方安装包或 winget：
+仅当从源码运行或自行打包 EXE 时，才需要 Python 3.10+：
 
 ```powershell
-winget install --id Python.Python.3.12 -e
+python -m pip install ttkbootstrap pyinstaller
 ```
+
+`ttkbootstrap` 可选，装了才有主题皮肤，缺失时自动退回原生 ttk 控件。
 
 ## 启动 GUI
 
@@ -260,7 +245,7 @@ GUI 包含三个页面：
 - 包内附 `ocp_manifest` 表，记录来源主机、上传时间和会话清单（标题/目录/消息数/数据量）
 - 下载：拉取远端 → 列出会话包 → 选中后**并入本地库**。并入时先删除本地同 ID 会话的关联行，再以包内数据覆盖，整个过程在同一事务内完成，失败自动回滚；本地其它会话不受影响
 - 本地同步工作区：`%LOCALAPPDATA%\opencode-git-sync`（私库的 clone）
-- **不包含**：登录凭据（`account`/`credential` 等）、项目代码、磁盘上的 `tool-output/` 附件。B 机需要自行登录 opencode，项目代码请用 Git 同步
+- **不包含**：登录凭据（`account`/`credential` 等）、项目代码、磁盘上的 `tool-output/` 附件。另一台电脑需要自行登录 opencode，项目代码请用 Git 同步
 
 ### 安全须知
 
@@ -285,27 +270,8 @@ D:\PythonProjects\claudeproject
 
 建议：
 
-- 项目代码不进会话同步流程：有远端仓库的 Git 项目在 B 机使用 `git clone`，日常 `git pull/push`
+- 项目代码不进会话同步流程：有远端仓库的 Git 项目在另一台电脑使用 `git clone`，日常 `git pull/push`
 - 会话同步只用 GUI 的「上传所选会话 / 下载并并入所选」，不要手动往同步工作区提交其他文件
-
-## B 机初始化
-
-1. 把 `tools` 文件夹复制到 B 机。
-2. 使用管理员 PowerShell 运行：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install-remote.ps1
-```
-
-脚本会尝试完成以下工作：
-
-- 安装缺失的 Git、Node.js 和 Python
-- 安装 `opencode-ai` 和 `ttkbootstrap`
-- 创建 B 机桌面快捷方式
-- 将工具目录加入 PATH
-
-3. 打开 B 机 GUI「会话同步」页，填入与 A 机相同的私库地址和 PAT，点 **保存并准备仓库**。
-4. 点 **刷新远端会话包**，选中要同步的包，点 **下载并并入所选**，然后到「会话管理」按 F5 查看。
 
 ## 自检与测试
 
@@ -341,14 +307,14 @@ python tools\ocp-gui.py smoke
 
 当前版本已经给 WMI、`tasklist` 和 git 子进程增加 `CREATE_NO_WINDOW`。如果仍然弹出，确认启动的是项目目录下最新的 `ocp-gui.cmd`，而不是旧的 `%USERPROFILE%\bin\ocp-gui.cmd`。
 
-### B 机看不到历史会话
+### 另一台电脑看不到历史会话
 
 依次检查：
 
-1. B 机是否已在「会话同步」页配置同一私库并点过 **刷新远端会话包**，再选中包点 **下载并并入所选**
+1. 是否已在「会话同步」页配置同一私库并点过 **刷新远端会话包**，再选中包点 **下载并并入所选**
 2. 并入完成后到「会话管理」按 F5 刷新
-3. B 机的 opencode 是否已安装，并且已登录（会话包不含登录凭据）
-4. 会话目录不存在时，需要先在 B 机把项目代码 clone/pull 到同一路径
+3. 该机的 opencode 是否已安装，并且已登录（会话包不含登录凭据）
+4. 会话目录不存在时，需要先在该机把项目代码 clone/pull 到同一路径
 5. 是否启动的是项目 `tools` 目录中的 GUI
 
 ### 保存并准备仓库失败
@@ -360,7 +326,7 @@ python tools\ocp-gui.py smoke
 
 | 提示 | 原因 | 处理 |
 | --- | --- | --- |
-| `PAT 访问不到 owner/repo (404)` | token 的 Repository access 没勾这个仓库、地址写错、或仓库不存在 | 到 token 设置页勾上该仓库（见[第 1 步](#第-1-步a-机第一台电脑准备)），或核对地址。提示里会列出该 PAT 当前能看到的仓库，可直接对比 |
+| `PAT 访问不到 owner/repo (404)` | token 的 Repository access 没勾这个仓库、地址写错、或仓库不存在 | 到 token 设置页勾上该仓库（见[准备](#1-准备每台电脑一次)），或核对地址。提示里会列出该 PAT 当前能看到的仓库，可直接对比 |
 | `PAT 对 owner/repo 只有只读权限(403)` | `Contents` 给的是 Read-only | 改为 `Read and write` |
 | `PAT 无效或已过期(401)` | token 被吊销或过期 | 重新生成后粘贴 |
 | `git 需要交互式凭证但已禁用` | 无 PAT 且本机没有可用 git 凭据 | 改用 HTTPS+PAT，或先行配置 SSH/凭据管理器 |
