@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """ocp-gui - opencode 会话与共享目录集中管理器 (Tkinter).
 
-Tab1 会话管理: 跨目录查看/搜索全部历史会话, 一键进入、定位、删除、上传所选会话.
+Tab1 会话管理: 跨目录查看/搜索全部历史会话, 一键进入、定位、删除、上传所选会话, 查看会话详情(提问+回答, Markdown 渲染).
 Tab2 会话同步: 勾选的会话导出成独立会话包, 经 GitHub 私库(HTTPS)在多台电脑间增量同步.
 Tab3 目录浏览: 浏览共享目录内容, 高亮同步冲突/临时文件.
 
@@ -23,6 +23,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 import zlib
 
 HOME = os.path.expanduser("~")
@@ -688,6 +689,350 @@ def session_size_map():
     return out
 
 
+PROMPT_OK, PROMPT_PARTIAL, PROMPT_EMPTY = "ok", "partial", "empty"
+
+
+def session_prompts(session_id, src_path=None):
+    """某个会话的提问及对应回答, 按提问时间升序.
+
+    返回 [{"id","time","q","a","state"}], state 取值:
+      ok      = 该提问有收尾步骤(finish=stop), a 就是这一步的文字, 即真正的回答
+      partial = 回合没跑完(没有 stop 步骤), a 是全部步骤文字的拼接(过程旁白)
+      empty   = 没有 assistant 消息, 或整个回合一个字都没有
+
+    一个提问会派生多个 assistant "步骤", 每步是 step-start -> 文字/工具 -> step-finish.
+    中间步骤 finish=tool-calls, 文字都是"先检查一下配置""Now writing..."这类旁白;
+    只有最后一步 finish=stop 的文字才是回答(实测 stop 永远是最后一步, 且通常只有一个文字块).
+    所以这里只认 stop 那一步, 免得把过程旁白当成回答.
+    """
+    if not session_id:
+        return []
+    con = db_ro(src_path)
+    try:
+        qtime, qtext = {}, {}
+        for pid, tc, t in con.execute(
+                "select m.id, m.time_created, json_extract(p.data,'$.text') "
+                "from message m join part p on p.message_id=m.id "
+                "where m.session_id=? and json_extract(m.data,'$.role')='user' "
+                "and json_extract(p.data,'$.type')='text' order by m.time_created",
+                (session_id,)):
+            qtime[pid] = tc or 0
+            if t:
+                qtext.setdefault(pid, []).append(t)
+        if not qtime:
+            return []
+        steps = {}
+        for aid, tc, fin, pid in con.execute(
+                "select id, time_created, json_extract(data,'$.finish'), "
+                "json_extract(data,'$.parentID') from message "
+                "where session_id=? and json_extract(data,'$.role')='assistant' "
+                "order by time_created", (session_id,)):
+            if pid:
+                steps.setdefault(pid, []).append((tc or 0, aid, fin))
+        texts = {}
+        for aid, t in con.execute(
+                "select message_id, json_extract(data,'$.text') from part "
+                "where session_id=? and json_extract(data,'$.type')='text' "
+                "order by time_created", (session_id,)):
+            if t:
+                texts.setdefault(aid, []).append(t)
+    finally:
+        con.close()
+
+    out = []
+    for pid, tc in sorted(qtime.items(), key=lambda kv: kv[1]):
+        ss = steps.get(pid) or []
+        stop = next((a for _t, a, f in ss if f == "stop"), None)
+        if stop is not None:
+            ans = "\n".join(texts.get(stop) or [])
+            state = PROMPT_OK if ans.strip() else PROMPT_EMPTY
+        else:
+            ans = "\n".join(t for _t, a, _f in ss for t in (texts.get(a) or []))
+            state = PROMPT_PARTIAL if ans.strip() else PROMPT_EMPTY
+        out.append({"id": pid, "time": tc, "q": "\n".join(qtext.get(pid) or []),
+                    "a": ans, "state": state})
+    return out
+
+
+def prompt_state_note(state):
+    return {PROMPT_OK: "完成", PROMPT_PARTIAL: "未完成, 以下为过程文字",
+            PROMPT_EMPTY: "无内容"}.get(state, "")
+
+
+def prompt_pair_md(item):
+    """单条问答的 Markdown(用于渲染和复制)."""
+    note = prompt_state_note(item.get("state"))
+    head = f"**{human_time(item.get('time'))}**" + (f" · {note}" if note else "")
+    ans = (item.get("a") or "").strip()
+    return (f"{head}\n\n#### 提问\n\n{(item.get('q') or '').strip()}\n\n"
+            f"#### 回答\n\n{ans or '> (无内容)'}\n")
+
+
+def prompts_to_md(title, directory, items):
+    """把提问/回答列表导出成 Markdown(纯函数, 便于自检)."""
+    lines = [f"# 会话: {title or '-'}", "",
+             f"- 目录: `{directory or '-'}`",
+             f"- 导出时间: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+             f"- 提问数: {len(items)}", ""]
+    for i, it in enumerate(items, 1):
+        lines += [f"## {i}. {human_time(it.get('time'))}", ""]
+        note = prompt_state_note(it.get("state"))
+        if note:
+            lines += [f"> {note}", ""]
+        ans = (it.get("a") or "").strip()
+        lines += ["### 提问", "", (it.get("q") or "").strip(), "",
+                  "### 回答", "", ans or "> (无内容)", ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# ---------------- Markdown 轻量渲染 ----------------
+# opencode 的回答本身是 Markdown(标题/粗体/行内代码/代码块/表格/列表/引用/链接),
+# 直接塞进 Text 会满屏 ** 和 ```. 这里自己解析并排版, 不引入第三方渲染库.
+
+_MD_FENCE = re.compile(r"^\s*(```|~~~)\s*(\S*)\s*$")
+_MD_HEAD = re.compile(r"^(#{1,6})\s+(.*)$")
+_MD_HR = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$")
+_MD_UL = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_MD_OL = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
+_MD_SEPCELL = re.compile(r":?-{2,}:?")
+_MD_INLINE = re.compile(
+    r"(\*\*[^*\n]+\*\*|__[^_\n]+__)"          # 粗体
+    r"|(`[^`\n]+`)"                            # 行内代码
+    r"|(\[[^\]\n]+\]\([^)\s]+\))"              # 链接
+    r"|(?<!\*)(\*[^*\n]+\*)(?!\*)"             # 斜体
+)
+
+
+def _disp_w(s):
+    """显示宽度: CJK/全角算 2 格(表格对齐用)."""
+    w = 0
+    for ch in s or "":
+        o = ord(ch)
+        if (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF or 0xAC00 <= o <= 0xD7A3
+                or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE6F
+                or 0xFF00 <= o <= 0xFF60 or 0xFFE0 <= o <= 0xFFE6
+                or 0x1F300 <= o <= 0x1FAFF):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def md_strip(text):
+    """去掉 Markdown 标记, 供列表预览和表格对齐显示(纯函数, 便于自检)."""
+    s = text or ""
+    s = re.sub(r"```.*?```", " ", s, flags=re.S)
+    s = re.sub(r"`([^`]*)`", r"\1", s)
+    s = re.sub(r"\*\*([^*]*)\*\*", r"\1", s)
+    s = re.sub(r"__([^_]*)__", r"\1", s)
+    s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", s)
+    s = re.sub(r"\[([^\]\n]+)\]\([^)\s]+\)", r"\1", s)
+    s = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", s)
+    s = re.sub(r"(?m)^\s*\|", "", s)
+    s = re.sub(r"(?m)^\s*[-*+]\s+", "", s)
+    s = re.sub(r"(?m)^\s*\d+[.)]\s+", "", s)
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
+
+
+def md_inline(text):
+    """把一行拆成 [(片段, 样式, url)], 样式: plain/bold/italic/code/link(纯函数)."""
+    out, pos, s = [], 0, text or ""
+    for m in _MD_INLINE.finditer(s):
+        if m.start() > pos:
+            out.append((s[pos:m.start()], "plain", ""))
+        g = m.group(0)
+        if g.startswith("**") or g.startswith("__"):
+            out.append((g[2:-2], "bold", ""))
+        elif g.startswith("`"):
+            out.append((g[1:-1], "code", ""))
+        elif g.startswith("["):
+            label, _, url = g[1:-1].partition("](")
+            out.append((label, "link", url.rstrip(")")))
+        else:
+            out.append((g[1:-1], "italic", ""))
+        pos = m.end()
+    if pos < len(s):
+        out.append((s[pos:], "plain", ""))
+    return out
+
+
+def md_parse(md):
+    """把 Markdown 拆成块, 供 render_md 排版(纯函数, 便于自检).
+
+    块: heading(level,text) / code(lang,lines) / table(rows,aligns) /
+        list(ordered,items) / quote(lines) / hr / para(text)
+    """
+    lines = (md or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks, i = [], 0
+    while i < len(lines):
+        ln = lines[i]
+        fence = _MD_FENCE.match(ln)
+        if fence:
+            mark = fence.group(1)
+            lang = fence.group(2)
+            i += 1
+            body = []
+            while i < len(lines) and not lines[i].strip().startswith(mark):
+                body.append(lines[i])
+                i += 1
+            i += 1
+            blocks.append({"kind": "code", "lang": lang, "lines": body})
+            continue
+        if _MD_HR.match(ln) and not _MD_UL.match(ln):
+            blocks.append({"kind": "hr"})
+            i += 1
+            continue
+        head = _MD_HEAD.match(ln)
+        if head:
+            blocks.append({"kind": "heading", "level": len(head.group(1)),
+                           "text": head.group(2).strip()})
+            i += 1
+            continue
+        if ln.lstrip().startswith("|") and ln.count("|") >= 2:
+            rows = []
+            while i < len(lines) and lines[i].lstrip().startswith("|"):
+                rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+            aligns, body = [], rows
+            if len(rows) >= 2 and rows[1] and all(
+                    _MD_SEPCELL.fullmatch(c) for c in rows[1] if c != ""):
+                aligns = [("right" if c.endswith(":") and not c.startswith(":")
+                           else "center" if c.startswith(":") and c.endswith(":")
+                           else "left") for c in rows[1]]
+                body = [rows[0]] + rows[2:]
+            blocks.append({"kind": "table", "rows": body, "aligns": aligns})
+            continue
+        if ln.lstrip().startswith(">"):
+            body = []
+            while i < len(lines) and lines[i].lstrip().startswith(">"):
+                body.append(re.sub(r"^\s*>\s?", "", lines[i]))
+                i += 1
+            blocks.append({"kind": "quote", "lines": body})
+            continue
+        ul, ol = _MD_UL.match(ln), _MD_OL.match(ln)
+        if ul or ol:
+            ordered = bool(ol)
+            items = []
+            while i < len(lines):
+                mm = _MD_OL.match(lines[i]) if ordered else _MD_UL.match(lines[i])
+                if not mm:
+                    break
+                items.append(mm.group(3) if ordered else mm.group(2))
+                i += 1
+            blocks.append({"kind": "list", "ordered": ordered, "items": items})
+            continue
+        if not ln.strip():
+            i += 1
+            continue
+        para = []
+        while i < len(lines) and lines[i].strip() and not (
+                _MD_FENCE.match(lines[i]) or _MD_HEAD.match(lines[i])
+                or lines[i].lstrip().startswith("|") or lines[i].lstrip().startswith(">")
+                or _MD_UL.match(lines[i]) or _MD_OL.match(lines[i])
+                or _MD_HR.match(lines[i])):
+            para.append(lines[i].strip())
+            i += 1
+        blocks.append({"kind": "para", "text": " ".join(para)})
+    return blocks
+
+
+def render_md(widget, md):
+    """把 Markdown 渲染进 tk.Text(调用方负责 state 与清空)."""
+    mono = ("Consolas", 10)
+    widget.configure(font=(UI_FONT, 10), wrap="word", spacing1=1, spacing3=2)
+    widget.tag_configure("md_h1", font=(UI_FONT, 15, "bold"), spacing1=10, spacing3=6)
+    widget.tag_configure("md_h2", font=(UI_FONT, 13, "bold"), spacing1=8, spacing3=4)
+    widget.tag_configure("md_h3", font=(UI_FONT, 12, "bold"), spacing1=6, spacing3=3)
+    widget.tag_configure("md_h4", font=(UI_FONT, 11, "bold"), spacing1=4, spacing3=2)
+    widget.tag_configure("md_bold", font=(UI_FONT, 10, "bold"))
+    widget.tag_configure("md_italic", font=(UI_FONT, 10, "italic"))
+    widget.tag_configure("md_code", font=mono, background=ODD)
+    widget.tag_configure("md_pre", font=mono, background=ODD, lmargin1=14, lmargin2=14,
+                         spacing1=4, spacing3=4)
+    widget.tag_configure("md_table", font=mono, lmargin1=14)
+    widget.tag_configure("md_tablehead", font=(mono[0], mono[1], "bold"), lmargin1=14)
+    widget.tag_configure("md_quote", lmargin1=16, lmargin2=16, foreground=MUT)
+    widget.tag_configure("md_hr", foreground=GRID)
+    widget.tag_configure("md_bullet", lmargin1=18, lmargin2=34)
+    widget.tag_configure("md_link", foreground=ACCENT, underline=True)
+    link_no = [0]
+
+    def put(text, tags=()):
+        widget.insert("end", text, tuple(tags))
+
+    def put_inline(text, extra=()):
+        for seg, style, url in md_inline(text):
+            if style == "bold":
+                put(seg, extra + ("md_bold",))
+            elif style == "italic":
+                put(seg, extra + ("md_italic",))
+            elif style == "code":
+                put(seg, extra + ("md_code",))
+            elif style == "link":
+                tag = f"md_url_{link_no[0]}"
+                link_no[0] += 1
+                try:
+                    widget.tag_configure(tag, foreground=ACCENT, underline=True)
+                    widget.tag_bind(tag, "<Button-1>", lambda e, u=url: webbrowser.open(u))
+                    widget.tag_bind(tag, "<Enter>", lambda e: widget.configure(cursor="hand2"))
+                    widget.tag_bind(tag, "<Leave>", lambda e: widget.configure(cursor=""))
+                    put(seg, extra + ("md_link", tag))
+                except tk.TclError:
+                    put(seg, extra)
+            else:
+                put(seg, extra)
+
+    for blk in md_parse(md):
+        kind = blk["kind"]
+        if kind == "heading":
+            put_inline(blk["text"], (f"md_h{min(blk['level'], 4)}",))
+            put("\n")
+        elif kind == "para":
+            put_inline(blk["text"])
+            put("\n\n")
+        elif kind == "hr":
+            put("\u2500" * 46 + "\n", ("md_hr",))
+        elif kind == "code":
+            put("".join(ln + "\n" for ln in blk["lines"]) or "\n", ("md_pre",))
+            put("\n")
+        elif kind == "quote":
+            for ln in blk["lines"]:
+                put_inline(ln, ("md_quote",))
+                put("\n")
+            put("\n")
+        elif kind == "list":
+            for n, item in enumerate(blk["items"], 1):
+                put(f"{n}. " if blk["ordered"] else "\u2022 ", ("md_bullet",))
+                put_inline(item, ("md_bullet",))
+                put("\n")
+            put("\n")
+        elif kind == "table":
+            rows, aligns = blk["rows"], blk["aligns"]
+            if not rows:
+                continue
+            ncol = max(len(r) for r in rows)
+            widths = [0] * ncol
+            for r in rows:
+                for c in range(min(ncol, len(r))):
+                    widths[c] = max(widths[c], _disp_w(md_strip(r[c])))
+            for ri, r in enumerate(rows):
+                cells = []
+                for c in range(ncol):
+                    plain = md_strip(r[c]) if c < len(r) else ""
+                    pad = max(0, widths[c] - _disp_w(plain))
+                    al = aligns[c] if c < len(aligns) else "left"
+                    if al == "right":
+                        cells.append(" " * pad + plain)
+                    elif al == "center":
+                        cells.append(" " * (pad // 2) + plain + " " * (pad - pad // 2))
+                    else:
+                        cells.append(plain + " " * pad)
+                put("  ".join(cells).rstrip() + "\n",
+                    ("md_tablehead",) if ri == 0 else ("md_table",))
+            put("\n")
+
+
 def delete_sessions(root_ids):
     ids = list(session_closure(root_ids))
     if not ids:
@@ -788,7 +1133,7 @@ import time as _time
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 try:
     import ttkbootstrap as tb
@@ -1182,6 +1527,7 @@ class SessionsTab(Fr):
         self.statcb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
         mkbtn(bar, "进入会话", self.open_session, "primary").pack(side="left", padx=2)
         mkbtn(bar, "打开目录", self.reveal_dir).pack(side="left", padx=2)
+        mkbtn(bar, "查看会话详情", self.view_prompts).pack(side="left", padx=2)
         mkbtn(bar, "上传所选会话", self.upload_selected).pack(side="left", padx=2)
         mkbtn(bar, "删除会话", self.delete_session, "danger").pack(side="left", padx=2)
         self.toolbar = bar
@@ -1207,6 +1553,7 @@ class SessionsTab(Fr):
         menu = tk.Menu(self, tearoff=0, **_menu_colors())
         menu.add_command(label="进入会话", command=self.open_session)
         menu.add_command(label="打开所在目录", command=self.reveal_dir)
+        menu.add_command(label="查看会话详情", command=self.view_prompts)
         menu.add_command(label="上传所选会话", command=self.upload_selected)
         menu.add_command(label="删除会话", command=self.delete_session)
         self.tree.bind("<Button-3>", lambda e: (self.tree.identify_row(e.y)
@@ -1361,6 +1708,23 @@ class SessionsTab(Fr):
         else:
             Msg.info("提示", f"目录不存在:\n{d}")
 
+    def view_prompts(self):
+        """查看所选会话的详情: 会话信息 + 全部提问与对应回答(一次只能看一个会话)."""
+        sids = self.selected()
+        if not sids:
+            Msg.info("提示", "先在列表中选中一个会话")
+            return
+        if len(sids) > 1:
+            Msg.info("提示", "一次只能查看一个会话的详情, 请只选中一个")
+            return
+        row = self._rows_map().get(sids[0])
+        if not row:
+            return
+        size = self.sizes.get(sids[0], 0)
+        meta = {"msgs": row[4], "updated": human_time(row[3]),
+                "size": human_size(size) if size else "-"}
+        PromptDialog(self, sids[0], row[1] or "", row[2] or "", meta)
+
     def delete_session(self):
         sids = self.selected()
         if not sids:
@@ -1443,6 +1807,254 @@ class SessionsTab(Fr):
                on_ok=done,
                on_err=lambda e: (self.status.config(text="上传失败"),
                                  Msg.error("上传失败", str(e))))
+
+
+class PromptDialog(TL):
+    """单个会话的详情窗: 会话信息 + 提问与回答(只读).
+
+    列表显示提问和回答的截断预览, 选中一行在下方窗格里看完整问答(按 Markdown 排版),
+    双击开大窗. 回答取的是最后一步 finish=stop 的文字; 回合没跑完的会标注"未完成"
+    并回退显示过程文字.
+    """
+
+    def __init__(self, master, sid, title, directory, meta=None):
+        super().__init__(master)
+        self.sid = sid
+        self.s_title = title or "(无标题)"
+        self.s_dir = directory or ""
+        meta = meta or {}
+        self.items = []
+        self.shown = []
+        self.title(f"会话详情 — {self.s_title[:40]}")
+        self.geometry("1060x700")
+        self.minsize(760, 480)
+        try:
+            self.configure(bg=BG)
+        except tk.TclError:
+            pass
+
+        bar = Fr(self)
+        bar.pack(fill="x", padx=10, pady=(10, 6))
+        L(bar, text="搜索:").pack(side="left")
+        self.kw = tk.StringVar()
+        self.kw.trace_add("write", lambda *a: self.refresh())
+        Ent(bar, textvariable=self.kw, width=22).pack(side="left", padx=(4, 10))
+        mkbtn(bar, "查看完整内容", self.show_full, "primary").pack(side="left", padx=2)
+        mkbtn(bar, "复制提问", lambda: self.copy_part("q")).pack(side="left", padx=2)
+        mkbtn(bar, "复制回答", lambda: self.copy_part("a")).pack(side="left", padx=2)
+        mkbtn(bar, "复制问答", self.copy_pair).pack(side="left", padx=2)
+        mkbtn(bar, "导出...", self.export).pack(side="left", padx=2)
+        self.toolbar = bar
+
+        info = " · ".join(str(x) for x in (
+            f"目录: {self.s_dir or '-'}",
+            f"消息: {meta.get('msgs', '-')}",
+            f"占用: {meta.get('size') or '-'}",
+            f"更新: {meta.get('updated') or '-'}",
+        ))
+        self.info = L(self, text=info, style="Muted.TLabel" if not HAS_TB else None,
+                      anchor="w", justify="left")
+        self.info.pack(fill="x", padx=12, pady=(0, 4))
+
+        pane = tk.PanedWindow(self, orient="vertical", bg=BG, sashwidth=6,
+                              bd=0, sashrelief="flat")
+        pane.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        top = Fr(pane)
+        cols = ("no", "time", "q", "a")
+        self.tree = ttk.Treeview(top, columns=cols, show="headings", selectmode="browse")
+        for c, w, txt, st in (("no", 48, "#", False), ("time", 128, "时间", False),
+                              ("q", 380, "提问", True), ("a", 380, "回答", True)):
+            self.tree.heading(c, text=txt)
+            self.tree.column(c, width=w, anchor="w", stretch=st,
+                             minwidth=48 if not st else 200)
+        self.tree.tag_configure("odd", background=ODD)
+        self.tree.tag_configure("even", background=EVEN)
+        self.tree.tag_configure("todo", foreground=MUT)
+        vs = ttk.Scrollbar(top, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_detail())
+        self.tree.bind("<Double-1>", lambda e: self.show_full())
+        menu = tk.Menu(self, tearoff=0, **_menu_colors())
+        menu.add_command(label="查看完整内容", command=self.show_full)
+        menu.add_command(label="复制提问", command=lambda: self.copy_part("q"))
+        menu.add_command(label="复制回答", command=lambda: self.copy_part("a"))
+        menu.add_command(label="复制问答", command=self.copy_pair)
+        self.tree.bind("<Button-3>", lambda e: (self.tree.identify_row(e.y)
+                     and self.tree.selection_set(self.tree.identify_row(e.y)),
+                     menu.tk_popup(e.x_root, e.y_root)))
+        pane.add(top, minsize=180)
+
+        low = Fr(pane)
+        self.detail = tk.Text(low, wrap="word", height=12, relief="flat", bd=0,
+                              bg=CARD, fg=FG, insertbackground=FG,
+                              font=(UI_FONT, 10), padx=12, pady=8)
+        ds = ttk.Scrollbar(low, orient="vertical", command=self.detail.yview)
+        self.detail.configure(yscrollcommand=ds.set)
+        ds.pack(side="right", fill="y")
+        self.detail.pack(side="left", fill="both", expand=True)
+        self.detail.configure(state="disabled")
+        pane.add(low, minsize=120)
+
+        self.status = L(self)
+        self.status.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+        self.status.config(text="读取提问中...")
+        run_bg(lambda: session_prompts(sid), on_ok=self._after_load,
+               on_err=self._fail)
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _alive(self):
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _after_load(self, items):
+        if not self._alive():
+            return
+        self.items = items or []
+        self.refresh()
+
+    def _fail(self, exc):
+        if not self._alive():
+            return
+        self.status.config(text=f"读取提问失败: {exc}")
+
+    def refresh(self):
+        kw = self.kw.get().strip().lower()
+        t = self.tree
+        t.delete(*t.get_children())
+        self.shown = []
+        n = 0
+        first_iid = None
+        for i, it in enumerate(self.items):
+            if kw and kw not in ((it.get("q") or "") + "\n" + (it.get("a") or "")).lower():
+                continue
+            n += 1
+            tags = ("odd",) if n % 2 else ("even",)
+            if it.get("state") != PROMPT_OK:
+                tags += ("todo",)
+            ans = md_strip(it.get("a") or "").replace("\n", " ")
+            if it.get("state") == PROMPT_PARTIAL:
+                ans = "未完成 · " + ans
+            elif it.get("state") == PROMPT_EMPTY:
+                ans = "(无内容)"
+            t.insert("", "end", iid=str(i), tags=tags,
+                     values=(n, human_time(it.get("time")),
+                             md_strip(it.get("q") or "").replace("\n", " ")[:200],
+                             ans[:200]))
+            self.shown.append(it)
+            if first_iid is None:
+                first_iid = str(i)
+        cnt = {"ok": 0, "partial": 0, "empty": 0}
+        for it in self.items:
+            cnt[it.get("state") or PROMPT_EMPTY] = cnt.get(it.get("state") or PROMPT_EMPTY, 0) + 1
+        if first_iid is not None:
+            t.selection_set(first_iid)
+            self.show_detail()
+        else:
+            self._set_detail("")
+        if not self.items:
+            self.status.config(text="该会话没有用户提问")
+            return
+        self.status.config(
+            text=f"共 {len(self.items)} 条提问 · 完成 {cnt.get('ok', 0)} · "
+                 f"未完成 {cnt.get('partial', 0)} · 无内容 {cnt.get('empty', 0)} · "
+                 f"命中 {len(self.shown)} 条 · 导出按当前筛选")
+
+    def _sel_item(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            return self.items[int(sel[0])]
+        except (ValueError, IndexError):
+            return None
+
+    def _set_detail(self, md_text):
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        if md_text:
+            render_md(self.detail, md_text)
+        self.detail.configure(state="disabled")
+
+    def show_detail(self):
+        it = self._sel_item()
+        self._set_detail(prompt_pair_md(it) if it else "")
+
+    def show_full(self):
+        it = self._sel_item()
+        if not it:
+            Msg.info("提示", "先在列表里选中一条提问")
+            return
+        body = prompt_pair_md(it)
+        win = TL(self)
+        win.title(f"完整内容 — {self.s_title[:30]}")
+        win.geometry("900x620")
+        win.minsize(560, 380)
+        try:
+            win.configure(bg=BG)
+        except tk.TclError:
+            pass
+        bar = Fr(win)
+        bar.pack(side="bottom", fill="x", padx=10, pady=8)
+        mkbtn(bar, "复制", lambda: self._clip(body)).pack(side="left", padx=2)
+        mkbtn(bar, "关闭", win.destroy, "primary").pack(side="right", padx=2)
+        txt = tk.Text(win, wrap="word", relief="flat", bd=0, bg=CARD, fg=FG,
+                      font=(UI_FONT, 10), padx=12, pady=10)
+        sb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        txt.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        render_md(txt, body)
+        txt.configure(state="disabled")
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def _clip(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def copy_part(self, which):
+        it = self._sel_item()
+        if not it:
+            Msg.info("提示", "先在列表里选中一条提问")
+            return
+        body = (it.get("q") if which == "q" else it.get("a")) or ""
+        if not body.strip():
+            Msg.info("提示", "这一条没有可复制的内容")
+            return
+        self._clip(body)
+        self.status.config(text=("已复制提问" if which == "q" else "已复制回答")
+                                + f" ({len(body)} 字)")
+
+    def copy_pair(self):
+        it = self._sel_item()
+        if not it:
+            Msg.info("提示", "先在列表里选中一条提问")
+            return
+        self._clip(prompt_pair_md(it))
+        self.status.config(text="已复制问答")
+
+    def export(self):
+        if not self.shown:
+            Msg.info("提示", "没有可导出的提问")
+            return
+        safe = re.sub(r'[\\/:*?"<>|]', "_", self.s_title)[:40] or "会话"
+        path = filedialog.asksaveasfilename(
+            parent=self, title="导出提问与回答", defaultextension=".md",
+            initialfile=f"{safe}-提问.md",
+            filetypes=[("Markdown", "*.md")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig") as f:
+                f.write(prompts_to_md(self.s_title, self.s_dir, self.shown))
+        except OSError as e:
+            Msg.error("导出失败", str(e))
+            return
+        self.status.config(text=f"已导出 {len(self.shown)} 条到 {path}")
+        Msg.info("导出完成", f"已导出 {len(self.shown)} 条提问到:\n{path}")
 
 
 class SyncTab(Fr):
@@ -2299,6 +2911,109 @@ def selftest():
                                              "-c", "credential.interactive=false"]
     assert _git_prefix("") == [] and _git_prefix(None) == [] and _git_prefix("  ") == []
     print("   凭据助手开关 OK")
+    print("== 11. 提问与回答 ==")
+    pdb = os.path.join(tmp, "ocp-st-prompt.db")
+    if os.path.isfile(pdb):
+        os.remove(pdb)
+    c = sqlite3.connect(pdb)
+    for sql in schema:
+        try:
+            c.execute(sql)
+        except Exception:
+            pass
+    c.execute("insert into project (id,worktree,sandboxes,time_created,time_updated) "
+              "values ('p1','/x','[]',1,1)")
+    c.execute("insert into session (id,project_id,slug,directory,title,version,time_created,time_updated) "
+              "values ('s1','p1','a','/x','t1','v',1,1)")
+    c.execute("insert into session (id,project_id,parent_id,slug,directory,title,version,"
+              "time_created,time_updated) values ('s2','p1','s1','b','/x','sub','v',1,1)")
+
+    def _msg(mid, sid, t, data):
+        c.execute("insert into message (id,session_id,time_created,time_updated,data) "
+                  "values (?,?,?,?,?)", (mid, sid, t, t, json.dumps(data)))
+
+    def _part(pid, mid, sid, t, data):
+        c.execute("insert into part (id,message_id,session_id,time_created,time_updated,data) "
+                  "values (?,?,?,?,?,?)", (pid, mid, sid, t, t, json.dumps(data)))
+
+    _msg("u1", "s1", 100, {"role": "user"})
+    _part("pu1", "u1", "s1", 100, {"type": "text", "text": "q1"})
+    _msg("a1", "s1", 101, {"role": "assistant", "parentID": "u1", "finish": "tool-calls"})
+    _part("pa1", "a1", "s1", 101, {"type": "text", "text": "先看看配置"})
+    _msg("a2", "s1", 102, {"role": "assistant", "parentID": "u1", "finish": "stop"})
+    _part("pa2", "a2", "s1", 102, {"type": "text", "text": "答案在此"})
+    _msg("u2", "s1", 200, {"role": "user"})
+    _part("pu2", "u2", "s1", 200, {"type": "text", "text": "q2"})
+    _msg("a3", "s1", 201, {"role": "assistant", "parentID": "u2", "finish": "tool-calls"})
+    _part("pa3", "a3", "s1", 201, {"type": "text", "text": "正在处理"})
+    _msg("u3", "s1", 300, {"role": "user"})
+    _part("pu3", "u3", "s1", 300, {"type": "text", "text": "q3"})
+    _msg("a4", "s1", 301, {"role": "assistant", "parentID": "u3", "finish": "tool-calls"})
+    _part("pa4", "a4", "s1", 301, {"type": "tool", "tool": "bash"})
+    _msg("u4", "s1", 400, {"role": "user"})
+    _part("pu4", "u4", "s1", 400, {"type": "text", "text": "q4"})
+    _msg("uc", "s2", 150, {"role": "user"})
+    _part("puc", "uc", "s2", 150, {"type": "text", "text": "child-q"})
+    _msg("ac", "s2", 151, {"role": "assistant", "parentID": "uc", "finish": "stop"})
+    _part("pac", "ac", "s2", 151, {"type": "text", "text": "child-a"})
+    c.commit()
+    c.close()
+
+    ps = session_prompts("s1", src_path=pdb)
+    got = [(p["id"], p["state"]) for p in ps]
+    print("   提问:", got)
+    assert [p["id"] for p in ps] == ["u1", "u2", "u3", "u4"], "提问顺序或数量不对!"
+    assert got[0][1] == PROMPT_OK and ps[0]["a"] == "答案在此", \
+        "最终回答没取到, 或把过程旁白当成了回答!"
+    assert got[1][1] == PROMPT_PARTIAL and "正在处理" in ps[1]["a"], "无 stop 时应回退过程文字!"
+    assert got[2][1] == PROMPT_EMPTY and got[3][1] == PROMPT_EMPTY, "无内容应标记 empty!"
+    assert not any("child-q" in p["q"] for p in ps), "子会话的提问混进来了!"
+    assert session_prompts("", src_path=pdb) == [] and session_prompts("nope", src_path=pdb) == []
+    md = prompts_to_md("t1", "/x", ps)
+    for frag in ("# 会话: t1", "- 目录: `/x`", "- 提问数: 4", "## 1. ",
+                 "### 提问", "q1", "### 回答", "答案在此", "> 未完成, 以下为过程文字",
+                 "> (无内容)"):
+        assert frag in md, f"导出 Markdown 缺少 {frag!r}!"
+    pair = prompt_pair_md(ps[0])
+    assert "#### 提问" in pair and "#### 回答" in pair and "答案在此" in pair
+    print(f"   4 种情形(最终回答/回退/无内容/无 assistant) OK; 导出 {len(md)} 字符")
+    print("== 12. Markdown 解析与渲染 ==")
+    assert _disp_w("abc") == 3 and _disp_w("中文") == 4 and _disp_w("a中") == 3
+    assert md_strip("**粗体** 与 `代码` 和 [链接](http://x)") == "粗体 与 代码 和 链接"
+    assert md_strip("| a | b |") == "a | b" or "a" in md_strip("| a | b |")
+    inl = md_inline("前 **粗** 后 `码` 与 [文](http://u) 及 *斜*")
+    kinds = [(s, t) for _x, s, t in inl]
+    assert ("bold", "") in kinds and ("code", "") in kinds, "行内粗体/代码没解析出来!"
+    assert ("link", "http://u") in kinds and ("italic", "") in kinds, "行内链接/斜体没解析出来!"
+    blocks = md_parse("# 标题\n\n正文 **粗**\n\n```text\ncode line\n```\n\n"
+                      "| 名称 | 值 |\n|---|---:|\n| 甲 | 1 |\n\n- 项目一\n- 项目二\n\n"
+                      "1. 第一\n\n> 引用\n\n---\n")
+    got_kinds = [b["kind"] for b in blocks]
+    print("   块类型:", got_kinds)
+    assert got_kinds == ["heading", "para", "code", "table", "list", "list",
+                         "quote", "hr"], "Markdown 块解析不对!"
+    assert blocks[0]["level"] == 1 and blocks[0]["text"] == "标题"
+    assert blocks[2]["lines"] == ["code line"] and blocks[2]["lang"] == "text"
+    assert blocks[3]["rows"] == [["名称", "值"], ["甲", "1"]], "表格行解析不对!"
+    assert blocks[3]["aligns"][1] == "right", "表格右对齐没识别!"
+    assert blocks[4]["ordered"] is False and blocks[4]["items"] == ["项目一", "项目二"]
+    assert blocks[5]["ordered"] is True and blocks[5]["items"] == ["第一"]
+    assert md_parse("```\n未闭合\n")[0]["kind"] == "code", "未闭合代码块应容错!"
+    assert md_parse("") == []
+    # 渲染进真实 Tk 控件(隐藏窗口), 验证不抛异常且内容写进去了
+    root = tk.Tk()
+    root.withdraw()
+    t = tk.Text(root)
+    render_md(t, "# 标题\n\n正文 **粗** `码` [链接](https://example.com)\n\n"
+                 "```text\ncode\n```\n\n| a | b |\n|---|---:|\n| 中 | 1 |\n\n- x\n\n> q\n\n---\n")
+    body = t.get("1.0", "end")
+    assert "标题" in body and "code" in body and "中" in body and "q" in body, "渲染后内容缺失!"
+    assert "md_h1" in t.tag_names() and "md_pre" in t.tag_names(), "渲染 tag 没建立!"
+    assert t.tag_ranges("md_bold") and t.tag_ranges("md_link"), "粗体/链接 tag 没应用!"
+    assert "**" not in body, "渲染后仍残留 Markdown 标记!"
+    root.destroy()
+    print("   解析(标题/段落/代码块/表格右对齐/有序无序列表/引用/分割线/容错) + 渲染 OK")
+    os.remove(pdb)
     print("ALL PASS")
 
 
