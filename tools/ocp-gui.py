@@ -4,7 +4,7 @@
 
 Tab1 会话管理: 跨目录查看/搜索全部历史会话, 一键进入、定位、删除、上传所选会话, 查看会话详情(提问+回答, Markdown 渲染).
 Tab2 会话同步: 勾选的会话导出成独立会话包, 经 GitHub 私库(HTTPS)在多台电脑间增量同步.
-Tab3 目录浏览: 浏览共享目录内容, 高亮同步冲突/临时文件.
+Tab3 工作目录: 列出会话用过的工作目录, 大小/最后修改时间后台统计, 一键进入.
 
 用法:
   python ocp-gui.py            启动界面
@@ -654,7 +654,6 @@ def related_counts(ids):
 
 
 def session_size_map():
-    """{顶层会话id: 估算字节数} — message/part/event 数据长度按子会话归并到顶层."""
     child = {}
     roots = set()
     con = db_ro()
@@ -690,6 +689,90 @@ def session_size_map():
 
 
 PROMPT_OK, PROMPT_PARTIAL, PROMPT_EMPTY = "ok", "partial", "empty"
+
+
+def dir_name(path):
+    """目录的最后一级名称(D:/a/b -> b); 兼容 \\/ 混写与结尾分隔符."""
+    p = (path or "").replace("/", os.sep).rstrip("\\/")
+    return os.path.basename(p) or (path or "")
+
+
+def short_dir(path, keep=1):
+    """目录名 + 上一级, 用于区分同名目录(如下拉框显示)."""
+    p = (path or "").replace("/", os.sep).rstrip("\\/")
+    parts = [x for x in p.split(os.sep) if x]
+    if not parts:
+        return path or ""
+    if len(parts) <= keep + 1:
+        return os.sep.join(parts)
+    return os.sep.join(parts[-(keep + 1):])
+
+
+def dir_stats(path):
+    """递归统计目录: (字节数, 文件数, 最新修改时间戳).
+
+    用 os.scandir 手工递归(实测 31 个目录 0.37s; os.walk+getsize 要 6.5s),
+    顺便在同一个循环里取最新 mtime. 无权限/半路消失的项跳过, 不抛异常.
+    """
+    total = files = 0
+    newest = 0.0
+    stack = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = list(os.scandir(cur))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                else:
+                    st = e.stat()
+                    total += st.st_size
+                    files += 1
+                    if st.st_mtime > newest:
+                        newest = st.st_mtime
+            except OSError:
+                continue
+    return total, files, newest
+
+
+def session_dirs(src_path=None, hide_missing=True):
+    """会话使用的工作目录清单, 按会话数降序.
+
+    返回 [{"path","name","short","sessions","roots","exists"}]; path 保持库里原样,
+    name 是最后一级目录名. hide_missing=True 时只留磁盘上还在的目录.
+    """
+    con = db_ro(src_path)
+    try:
+        rows = con.execute(
+            "select directory, count(*), sum(case when parent_id is null then 1 else 0 end) "
+            "from session group by directory order by 2 desc, 1").fetchall()
+    finally:
+        con.close()
+    out = []
+    for d, c, r in rows:
+        if not d:
+            continue
+        ok = os.path.isdir(d)
+        if hide_missing and not ok:
+            continue
+        out.append({"path": d, "name": dir_name(d), "short": short_dir(d),
+                    "sessions": c or 0, "roots": r or 0, "exists": ok})
+    out.sort(key=lambda x: (-x["sessions"], x["name"].lower()))
+    return out
+
+
+def dirs_stats(paths):
+    """批量统计(供后台线程调用): {path: (bytes, files, newest_mtime)}."""
+    out = {}
+    for p in paths:
+        try:
+            out[p] = dir_stats(p)
+        except OSError:
+            out[p] = (0, 0, 0.0)
+    return out
 
 
 def session_prompts(session_id, src_path=None):
@@ -1187,6 +1270,61 @@ def _f(name, **kw):
         pass
 
 
+def fit_col_width(text, pad=32, minw=48):
+    """按表头文字实测宽度算列宽.
+
+    Treeview 表头用的是粗体 TkHeadingFont, 比正文字宽, 必须用它来量,
+    否则表头文字会被截断. pad 覆盖 Treeview.Heading 的 padding=(12,10)
+    (左右共 24px) 与排序/图标余量.
+    """
+    try:
+        w = tkfont.nametofont("TkHeadingFont").measure(text)
+    except tk.TclError:
+        w = len(str(text)) * 12
+    return max(minw, w + pad)
+
+
+def content_col_width(samples, head_text, pad=40, minw=48, maxw=None):
+    """按"表头 + 内容样本"里更宽的那个算列宽, 保证内容不被截断.
+
+    samples 用全量数据的候选值(不是当前可见行), 这样筛选/刷新时列宽不会跳动.
+    maxw 给列宽设上限, 免得单列把拉伸列(路径)挤没.
+    """
+    try:
+        w = max(tkfont.nametofont("TkHeadingFont").measure(head_text),
+                max((tkfont.nametofont("TkDefaultFont").measure(str(s))
+                     for s in samples), default=0))
+    except tk.TclError:
+        w = max(len(str(head_text)), max((len(str(s)) for s in samples), default=0)) * 12
+    want = max(minw, w + pad)
+    return min(want, maxw) if maxw else want
+
+
+def fit_columns(tree, cols, stretch_cols=(), pad=32, minw=48, content_cols=None, caps=None):
+    """把各列宽收到刚好放得下: 非拉伸列固定, 拉伸列吃掉剩余空间.
+
+    默认只按表头宽度算, 不跟随内容变化 —— 否则筛选/刷新时列宽会来回跳.
+    content_cols: {列id: [内容样本]} 这些列按表头与样本里更宽的一个算, 保证内容显示全.
+    caps: {列id: 最大宽度} 给个别列(尤其内容列)设上限, 避免挤掉拉伸列.
+    cols: [(列id, 表头文字, anchor), ...]
+    """
+    stretch_cols = tuple(stretch_cols)
+    content_cols = content_cols or {}
+    caps = caps or {}
+    for cid, text, anchor in cols:
+        st = cid in stretch_cols
+        if cid in content_cols:
+            want = content_col_width(content_cols[cid], text, pad, minw, caps.get(cid))
+        else:
+            want = fit_col_width(text, pad, minw)
+            if cid in caps:
+                want = min(want, caps[cid])
+        tree.heading(cid, text=text)
+        tree.column(cid, width=want, anchor=anchor, stretch=st,
+                    minwidth=minw if not st else max(minw, want))
+    return tree
+
+
 def load_theme():
     try:
         with open(THEME_FILE, encoding="utf-8") as f:
@@ -1531,13 +1669,13 @@ class SessionsTab(Fr):
         mkbtn(bar, "上传所选会话", self.upload_selected).pack(side="left", padx=2)
         mkbtn(bar, "删除会话", self.delete_session, "danger").pack(side="left", padx=2)
         self.toolbar = bar
-        cols = ("status", "time", "msgs", "size", "title", "dir")
+        cols = ("status", "msgs", "size", "title", "dir", "time", "path")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
-        for c, w, txt, st in (("status", 96, "状态", False), ("time", 124, "更新时间", False),
-                              ("msgs", 56, "消息", False), ("size", 82, "大小", False),
-                              ("title", 320, "标题", True), ("dir", 320, "目录", True)):
-            self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, anchor="w", stretch=st, minwidth=56 if not st else 160)
+        self.COLS = (("status", "状态", "w"), ("msgs", "消息", "w"), ("size", "大小", "w"),
+                     ("title", "标题", "w"), ("dir", "目录", "w"), ("time", "更新时间", "w"),
+                     ("path", "路径", "w"))
+        self.apply_col_widths()
+        self.tree.column("path", minwidth=200)
         self.tree.tag_configure("odd", background=ODD)
         self.tree.tag_configure("even", background=EVEN)
         self.tree.tag_configure("run", background=RUN_BG, foreground=RUN_FG,
@@ -1562,7 +1700,30 @@ class SessionsTab(Fr):
         self.rows = []
         self.smap = {}
         self.sizes = {}
+        self.dir_labels = {"全部": "全部"}
         self._loading = False
+
+    def apply_col_widths(self):
+        """状态/消息/大小/标题/目录/更新时间 取"表头与全量内容里更宽的"以显示全.
+
+        样本来自 self.rows(全量, 不是可见行), 所以筛选/刷新时列宽不跳动;
+        路径是唯一拉伸列, 吃剩余宽度.
+        """
+        rows = getattr(self, "rows", [])
+        title = [ (r[1] or "").strip().replace("\n", " ")[:56] for r in rows ] or [""]
+        dirs = [ dir_name(r[2]) for r in rows ] or [""]
+        msgs = [ r[4] for r in rows ] or ["0"]
+        times = [ human_time(r[3]) for r in rows ] or ["2026-09-20 17:34"]
+        fit_columns(self.tree, self.COLS, stretch_cols=("path",),
+                    content_cols={
+                        "status": ["● 运行中", "近期活跃", "空闲"],
+                        "msgs": msgs,
+                        "size": [human_size(n) for n in (1024, 5 << 20, 250 << 20, 3 << 30)] + ["9999.9GB"],
+                        "title": title,
+                        "dir": dirs,
+                        "time": times,
+                    },
+                    caps={"status": 88, "msgs": 76, "size": 104, "title": 320, "dir": 250})
 
     def load(self):
         if self._loading:
@@ -1586,16 +1747,45 @@ class SessionsTab(Fr):
         self.rows = rows
         self.smap = smap
         self.sizes = sizes
+        # 下拉框显示"名称(上级目录)"以区分同名目录; 值仍是库里的全路径, 靠 dirf 反查
+        self.dir_labels = {"全部": "全部"}
+        for d in sorted({r[2] for r in rows}):
+            self.dir_labels.setdefault(d, short_dir(d))
         cur = self.dirf.get()
-        dirs = ["全部"] + sorted({r[2] for r in rows})
-        self.dircb.config(values=dirs)
-        if cur not in dirs:
+        labels = ["全部"] + sorted({v for k, v in self.dir_labels.items() if k != "全部"})
+        self.dircb.config(values=labels)
+        if cur not in labels:
             self.dirf.set("全部")
+        self.apply_col_widths()
+        self.refresh()
+
+    def _dir_filter(self):
+        """当前选中的目录(库里原样路径); "全部" 表示不过滤."""
+        sel = self.dirf.get()
+        if sel == "全部":
+            return "全部"
+        for path, label in self.dir_labels.items():
+            if path != "全部" and label == sel:
+                return path
+        return "全部"
+
+    def filter_dir(self, path):
+        """供[工作目录]页跳转过来时预置目录筛选."""
+        self.load()
+        if not path or path == "全部":
+            self.dirf.set("全部")
+            self.refresh()
+            return
+        if path not in self.dir_labels:
+            self.dir_labels[path] = short_dir(path)
+            labels = ["全部"] + sorted({v for k, v in self.dir_labels.items() if k != "全部"})
+            self.dircb.config(values=labels)
+        self.dirf.set(self.dir_labels[path])
         self.refresh()
 
     def refresh(self):
         kw = self.kw.get().lower().strip()
-        d = self.dirf.get()
+        d = self._dir_filter()
         sf = self.statf.get()
         t = self.tree
         keep = set(t.selection())
@@ -1604,7 +1794,7 @@ class SessionsTab(Fr):
         for r in self.rows:
             if d != "全部" and r[2] != d:
                 continue
-            if kw and kw not in f"{r[1]} {r[2]}".lower():
+            if kw and kw not in f"{r[1]} {r[2]} {dir_name(r[2])}".lower():
                 continue
             txt, kind, _pids = self.smap.get(r[0], ("空闲", "idle", None))
             if sf == "空闲" and kind != "idle":
@@ -1621,9 +1811,9 @@ class SessionsTab(Fr):
             disp = f"● {txt}" if kind == "run" else txt
             b = self.sizes.get(r[0], 0)
             t.insert("", "end", iid=r[0], tags=tags,
-                     values=(disp, human_time(r[3]), r[4],
-                             human_size(b) if b else "-",
-                             (r[1] or "").strip().replace("\n", " ")[:56], r[2]))
+                     values=(disp, r[4], human_size(b) if b else "-",
+                             (r[1] or "").strip().replace("\n", " ")[:56],
+                             dir_name(r[2]), human_time(r[3]), r[2]))
             n += 1
         for k in keep:
             if t.exists(k):
@@ -1862,11 +2052,11 @@ class PromptDialog(TL):
         top = Fr(pane)
         cols = ("no", "time", "q", "a")
         self.tree = ttk.Treeview(top, columns=cols, show="headings", selectmode="browse")
-        for c, w, txt, st in (("no", 48, "#", False), ("time", 128, "时间", False),
-                              ("q", 380, "提问", True), ("a", 380, "回答", True)):
-            self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, anchor="w", stretch=st,
-                             minwidth=48 if not st else 200)
+        fit_columns(self.tree, (("no", "#", "w"), ("time", "时间", "w"),
+                                ("q", "提问", "w"), ("a", "回答", "w")),
+                    stretch_cols=("q", "a"))
+        self.tree.column("q", width=380, minwidth=200)
+        self.tree.column("a", width=380, minwidth=200)
         self.tree.tag_configure("odd", background=ODD)
         self.tree.tag_configure("even", background=EVEN)
         self.tree.tag_configure("todo", foreground=MUT)
@@ -2092,10 +2282,11 @@ class SyncTab(Fr):
           foreground=MUT, justify="left").pack(anchor="w")
         cols = ("item", "value", "note")
         self.stats = ttk.Treeview(self, columns=cols, show="headings", height=7, selectmode="none")
-        for c, w, txt, a in (("item", 180, "项目", "w"), ("value", 200, "数值", "w"),
-                             ("note", 420, "说明", "w")):
-            self.stats.heading(c, text=txt)
-            self.stats.column(c, width=w, anchor=a, minwidth=90)
+        fit_columns(self.stats, (("item", "项目", "w"), ("value", "数值", "w"),
+                                 ("note", "说明", "w")), stretch_cols=("note",))
+        self.stats.column("item", width=180, minwidth=90)
+        self.stats.column("value", width=200, minwidth=90)
+        self.stats.column("note", width=420, minwidth=90)
         self.stats.tag_configure("odd", background=ODD)
         self.stats.tag_configure("even", background=EVEN)
         lblrow = Fr(self)
@@ -2114,11 +2305,11 @@ class SyncTab(Fr):
         self.onlychk.pack(side="left", padx=(12, 0))
         cols2 = ("time", "host", "count", "size", "new", "file")
         self.tree = ttk.Treeview(self, columns=cols2, show="headings", selectmode="extended")
-        for c, w, txt, a in (("time", 140, "上传时间", "w"), ("host", 110, "来源机器", "w"),
-                             ("count", 60, "会话数", "w"), ("size", 90, "包大小", "w"),
-                             ("new", 70, "本机缺", "w"), ("file", 250, "会话包", "w")):
-            self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, anchor=a, minwidth=58)
+        fit_columns(self.tree, (("time", "上传时间", "w"), ("host", "来源机器", "w"),
+                                ("count", "会话数", "w"), ("size", "包大小", "w"),
+                                ("new", "本机缺", "w"), ("file", "会话包", "w")),
+                    stretch_cols=("file",))
+        self.tree.column("file", width=250, minwidth=58)
         self.tree.tag_configure("odd", background=ODD)
         self.tree.tag_configure("even", background=EVEN)
         # 只有前景色不同, 背景仍由 odd/even 提供(排后面的 tag 只覆盖自己声明的选项)
@@ -2337,134 +2528,247 @@ class SyncTab(Fr):
                  "到[会话管理]按 F5 查看; 若提示目录不存在, 先进目录 clone/pull 项目代码.")
 
 
-def _safe_isdir(e):
-    try:
-        return e.is_dir(follow_symlinks=False)
-    except OSError:
-        return False
-
-
 class BrowseTab(Fr):
+    """工作目录: 列出会话用过的工作目录, 大小/修改时间后台补齐, 一键进入."""
+
+    COLS = (("name", "目录名称", "w"), ("sessions", "会话", "e"),
+            ("mtime", "最后修改", "w"), ("size", "大小", "e"),
+            ("path", "绝对路径", "w"))
+
     def __init__(self, master):
         super().__init__(master, padding=(10, 8))
         bar = Fr(self)
         bar.pack(fill="x")
-        mkbtn(bar, "↑ 上一级", self.up).pack(side="left")
-        self.pathvar = tk.StringVar()
-        self.pathcb = Combo(bar, textvariable=self.pathvar, width=48)
-        self.pathcb.pack(side="left", fill="x", expand=True, padx=4)
-        self.pathcb.bind("<Return>", lambda e: self.goto(self.pathvar.get()))
-        mkbtn(bar, "进入", lambda: self.goto(self.pathvar.get())).pack(side="left")
-        self.roots = {"opencode会话数据": DATA_DIR,
-                      "opencode配置": os.path.join(HOME, ".config", "opencode"),
-                      "claudeproject": os.path.join("D:", os.sep, "PythonProjects", "claudeproject")}
-        self.hint = L(self, style="Muted.TLabel" if not HAS_TB else None,
-                      text="橙色=历史同步冲突文件  红色=同步临时残留  绿色=目录    文件删除/整理请右键“资源管理器中显示”后操作")
-        self.hint.pack(side="bottom", fill="x")
-        quick = ttk.LabelFrame(self, text="共享目录")
-        quick.pack(fill="x", pady=2)
-        for label, path in self.roots.items():
-            mkbtn(quick, label, lambda p=path: self.goto(p)).pack(side="left", padx=3, pady=3)
+        L(bar, text="搜索:").pack(side="left")
+        self.kw = tk.StringVar()
+        self.kw.trace_add("write", lambda *a: self.refresh())
+        Ent(bar, textvariable=self.kw, width=22).pack(side="left", padx=(4, 10))
+        mkbtn(bar, "打开目录", self.reveal, "primary").pack(side="left", padx=2)
+        mkbtn(bar, "启动 opencode", self.open_opencode).pack(side="left", padx=2)
+        mkbtn(bar, "开终端", self.open_terminal).pack(side="left", padx=2)
+        mkbtn(bar, "复制路径", self.copy_path).pack(side="left", padx=2)
+        mkbtn(bar, "刷新", self.load).pack(side="left", padx=2)
         self.toolbar = bar
-        self.toolbar2 = quick
-        cols = ("name", "size", "mtime")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings")
-        for c, w, txt, a, st in (("name", 420, "名称", "w", True), ("size", 80, "大小", "e", False),
-                                 ("mtime", 130, "修改时间", "w", False)):
-            self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, anchor=a, stretch=st, minwidth=140 if st else 70)
-        vs = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vs.set)
-        vs.pack(side="right", fill="y", pady=4)
-        self.tree.pack(side="left", fill="both", expand=True, pady=4, padx=(0, 2))
-        dk = HAS_TB
-        self.tree.tag_configure("dir", foreground="#2ecc71" if dk else "#0a7a44")
-        self.tree.tag_configure("conflict", background="#6b4a12" if dk else "#ffe0b3")
-        self.tree.tag_configure("sttmp", background="#6b2424" if dk else "#f4c7c7")
+
+        self.tree = ttk.Treeview(self, columns=[c for c, _t, _a in self.COLS],
+                                 show="headings", selectmode="extended")
+        fit_columns(self.tree, self.COLS, stretch_cols=("path",),
+                    content_cols={"mtime": ["2026-09-20 17:34"], "size": ["999.9GB"]},
+                    caps={"name": 280, "mtime": 210, "size": 110})
+        self.tree.column("path", minwidth=200)
         self.tree.tag_configure("odd", background=ODD)
         self.tree.tag_configure("even", background=EVEN)
-        self.tree.bind("<Double-1>", self.activate)
+        self.tree.tag_configure("miss", foreground=MUT)
+        for cid, label, _a in self.COLS:
+            self.tree.heading(cid, text=label, command=lambda c=cid: self.sort_by(c))
+        vs = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vs.set)
+        self.status = L(self)
+        self.status.pack(side="bottom", fill="x")
+        self.hint = L(self, text="双击=在资源管理器中打开  右键=启动 opencode / 开终端 / 筛选会话  "
+                                 "· 大小与修改时间由后台统计, 表头可点击排序", wraplength=900)
+        if HAS_TB:
+            self.hint.configure(style="Muted.TLabel")
+        self.hint.pack(side="bottom", fill="x")
+        vs.pack(side="right", fill="y", pady=4)
+        self.tree.pack(side="left", fill="both", expand=True, pady=4, padx=(0, 2))
+        self.tree.bind("<Double-1>", lambda e: self.reveal())
         menu = tk.Menu(self, tearoff=0, **_menu_colors())
-        menu.add_command(label="打开/进入", command=self.activate)
-        menu.add_command(label="资源管理器中显示", command=self.reveal)
+        menu.add_command(label="资源管理器中打开", command=self.reveal)
+        menu.add_command(label="启动 opencode", command=self.open_opencode)
+        menu.add_command(label="开终端", command=self.open_terminal)
         menu.add_command(label="复制完整路径", command=self.copy_path)
+        menu.add_command(label="在会话管理中筛选", command=self.filter_sessions)
         self.tree.bind("<Button-3>", lambda e: (self.tree.identify_row(e.y)
                      and self.tree.selection_set(self.tree.identify_row(e.y)),
                      menu.tk_popup(e.x_root, e.y_root)))
-        self.cur = None
-        first = next(iter(self.roots.values()), None)
-        if first:
-            self.goto(first)
+        self.toolbar2 = self.hint
+        self.rows = []
+        self.stats = {}
+        self.sort_key = "mtime"
+        self.sort_desc = True
+        self._loading = False
+        self.apply_col_widths()
 
-    def goto(self, path):
-        path = (path or "").strip().strip('"')
-        if not path or not os.path.isdir(path):
-            Msg.info("提示", f"目录不存在: {path}")
+    def apply_col_widths(self):
+        """目录名称/会话/最后修改/大小 按"表头与全量内容里更宽的"取宽, 路径吃剩余宽度.
+
+        样本只来自 self.rows/self.stats(全量, 不是可见行), 所以筛选时列宽不跳动.
+        """
+        rows = [d for d in self.rows if d["exists"]]
+        names = [d["name"] for d in rows] or [""]
+        mtimes = [dt.datetime.fromtimestamp(self.stats[d["path"]][2]).strftime("%Y-%m-%d %H:%M")
+                  for d in rows if self.stats.get(d["path"], (0, 0, 0))[2]] or ["2026-09-20 17:34"]
+        sizes = [human_size(self.stats[d["path"]][0])
+                 for d in rows if self.stats.get(d["path"], (0, 0, 0))[0]] or ["999.9GB"]
+        fit_columns(self.tree, self.COLS, stretch_cols=("path",),
+                    content_cols={"name": names, "mtime": mtimes, "size": sizes},
+                    caps={"name": 280, "mtime": 210, "size": 110})
+
+    def load(self):
+        if self._loading:
             return
-        self.cur = path
-        self.pathvar.set(path)
-        t = self.tree
-        t.delete(*t.get_children())
+        self._loading = True
+        self.status.config(text="读取工作目录中...")
+
+        def work():
+            hidden = session_dirs(hide_missing=False)
+            return [d for d in hidden if d["exists"]], sum(1 for d in hidden if not d["exists"])
+
+        def ok(res):
+            self._loading = False
+            dirs, missing = res
+            self.rows = dirs
+            self.missing = missing
+            self.stats = {}
+            self.apply_col_widths()
+            self.refresh()
+            self.status.config(text=f"统计大小与修改时间中… (共 {len(dirs)} 个目录)")
+            paths = [d["path"] for d in dirs if d["exists"]]
+            run_bg(lambda: dirs_stats(paths), on_ok=self._after_stats,
+                   on_err=lambda e: self.status.config(text=f"统计失败: {e}"))
+
+        run_bg(work, on_ok=ok, on_err=lambda e: self._fail(e))
+
+    def _fail(self, e):
+        self._loading = False
+        self.status.config(text=f"读取工作目录失败: {e}")
+
+    def _after_stats(self, st):
+        if not self._alive():
+            return
+        self.stats = st or {}
+        self.apply_col_widths()
+        self.refresh()
+
+    def _alive(self):
         try:
-            entries = list(os.scandir(path))
-        except OSError as e:
-            Msg.info("提示", f"无法读取: {e}")
-            return
-        entries.sort(key=lambda e: (not _safe_isdir(e), e.name.lower()))
-        for j, e in enumerate(entries):
-            try:
-                isdir = _safe_isdir(e)
-                stt = e.stat()
-                nm = e.name
-                tag = "dir" if isdir else ""
-                if "sync-conflict" in nm:
-                    tag = "conflict"
-                elif nm.startswith((".syncthing.", ".stfolder")):
-                    tag = "sttmp"
-                t.insert("", "end", iid=e.path,
-                         values=(("[目录] " if isdir else "") + nm,
-                                 "" if isdir else human_size(stt.st_size),
-                                 dt.datetime.fromtimestamp(stt.st_mtime).strftime("%Y-%m-%d %H:%M")),
-                         tags=("odd" if j % 2 else "even", tag))
-            except OSError:
-                continue
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
 
-    def up(self):
-        if self.cur:
-            parent = os.path.dirname(self.cur.rstrip("\\/"))
-            if parent and parent != self.cur:
-                self.goto(parent)
+    def sort_by(self, col):
+        if self.sort_key == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_key, self.sort_desc = col, col != "name"
+        self.refresh()
+
+    def _sorted_rows(self):
+        key = self.sort_key
+
+        def val(d):
+            if key == "name":
+                return d["name"].lower()
+            if key == "sessions":
+                return d["sessions"]
+            if key == "path":
+                return d["path"].lower()
+            if key == "size":
+                return self.stats.get(d["path"], (0, 0, 0))[0]
+            return self.stats.get(d["path"], (0, 0, 0))[2]
+
+        rows = [d for d in self.rows if d["exists"]]
+        rows.sort(key=val, reverse=self.sort_desc)
+        return rows
+
+    def refresh(self):
+        kw = self.kw.get().strip().lower()
+        t = self.tree
+        keep = set(t.selection())
+        t.delete(*t.get_children())
+        n = 0
+        total = 0
+        counted = 0
+        for d in self._sorted_rows():
+            if kw and kw not in f"{d['name']} {d['path']}".lower():
+                continue
+            b, _files, newest = self.stats.get(d["path"], (0, 0, 0))
+            if d["path"] in self.stats:
+                total += b
+                counted += 1
+            tags = ("odd",) if n % 2 else ("even",)
+            if not d["exists"]:
+                tags += ("miss",)
+            t.insert("", "end", iid=d["path"], tags=tags,
+                     values=(d["name"], d["sessions"],
+                             dt.datetime.fromtimestamp(newest).strftime("%Y-%m-%d %H:%M")
+                             if newest else "-",
+                             human_size(b) if d["path"] in self.stats else "-",
+                             d["path"]))
+            n += 1
+        for k in keep:
+            if t.exists(k):
+                try:
+                    t.selection_add(k)
+                except Exception:
+                    pass
+        extra = f" · 已隐藏 {getattr(self, 'missing', 0)} 个不存在的目录" if getattr(self, "missing", 0) else ""
+        cnt = f" · 合计 {human_size(total)}" if counted else ""
+        self.status.config(text=f"显示 {n} 个目录{cnt}{extra} · 双击进入, 右键更多操作")
 
     def _sel_path(self):
         s = self.tree.selection()
         return s[0] if s else None
 
-    def activate(self, _=None):
+    def _sel_win(self):
         p = self._sel_path()
-        if not p:
-            return
-        if os.path.isdir(p):
-            self.goto(p)
-        else:
-            try:
-                os.startfile(p)
-            except Exception as e:
-                Msg.error("打开失败", str(e))
+        return p.replace("/", os.sep) if p else None
 
     def reveal(self):
-        p = self._sel_path()
-        if p:
-            subprocess.Popen(["explorer", f"/select,{p}"])
+        p = self._sel_win()
+        if not p:
+            Msg.info("提示", "先在列表中选中一个目录")
+            return
+        if not os.path.isdir(p):
+            Msg.info("提示", f"目录不存在:\n{p}")
+            return
+        subprocess.Popen(["explorer", p], env=child_env())
+
+    def open_opencode(self):
+        p = self._sel_win()
+        if not p:
+            Msg.info("提示", "先在列表中选中一个目录")
+            return
+        if not os.path.isdir(p):
+            Msg.info("提示", f"目录不存在:\n{p}")
+            return
+        exe = find_opencode_exe()
+        if not exe:
+            Msg.error("错误", "找不到 opencode 可执行文件")
+            return
+        subprocess.Popen([exe], cwd=p, env=child_env(), creationflags=CREATE_NEW_CONSOLE)
+
+    def open_terminal(self):
+        p = self._sel_win()
+        if not p:
+            Msg.info("提示", "先在列表中选中一个目录")
+            return
+        if not os.path.isdir(p):
+            Msg.info("提示", f"目录不存在:\n{p}")
+            return
+        subprocess.Popen(["cmd"], cwd=p, env=child_env(), creationflags=CREATE_NEW_CONSOLE)
 
     def copy_path(self):
-        p = self._sel_path()
+        p = self._sel_win()
         if p:
             self.clipboard_clear()
             self.clipboard_append(p)
+            self.status.config(text=f"已复制路径: {p}")
+
+    def filter_sessions(self):
+        p = self._sel_path()
+        if not p:
+            Msg.info("提示", "先在列表中选中一个目录")
+            return
+        if app_ref is None:
+            return
+        app_ref.show("sessions")
+        app_ref.tab_sessions.filter_dir(p)
 
 
 _AppBase = tb.Window if HAS_TB else tk.Tk
-NAV_ITEMS = (("会话管理", "sessions"), ("会话同步", "sync"), ("目录浏览", "browse"))
+NAV_ITEMS = (("会话管理", "sessions"), ("会话同步", "sync"), ("工作目录", "browse"))
 
 
 class App(_AppBase):
@@ -2584,14 +2888,14 @@ class App(_AppBase):
         self.page_meta = {
             "sessions": ("会话管理", "跨目录查看、进入和维护所有 opencode 历史会话"),
             "sync": ("会话同步", "勾选的会话导出成独立会话包, 经 GitHub 私库(HTTPS)增量同步; 项目代码请用 Git 自行同步"),
-            "browse": ("目录浏览", "浏览共享工作目录，快速定位冲突和同步临时文件"),
+            "browse": ("工作目录", "会话用过的工作目录: 大小、最后修改时间, 一键进入/开终端/启动 opencode"),
         }
         self._cur = None
         self._wrappers = (self.tab_sync.info, self.tab_browse.hint, self.tab_sessions.status)
         self.bind("<Configure>", self._on_resize, add="+")
         keys = [k for _t, k in NAV_ITEMS]
         self.show(keys[tab] if 0 <= tab < len(keys) else "sessions")
-        self.bind("<F5>", lambda e: self.tab_sessions.load())
+        self.bind("<F5>", lambda e: self.refresh_current())
         self._nav_job = self.after(6000, self._tick)
         self._geometry_job = None
         self._last_geometry = None
@@ -2655,6 +2959,17 @@ class App(_AppBase):
             else:
                 lbl.config(bg=SIDEBAR, fg=MUT, font=(UI_FONT, 10))
         if key == "sessions" and not self.tab_sessions.rows:
+            self.tab_sessions.load()
+        elif key == "browse" and not self.tab_browse.rows:
+            self.tab_browse.load()
+
+    def refresh_current(self):
+        """F5: 刷新当前页."""
+        if self._cur == "sync":
+            self.tab_sync.show_remote()
+        elif self._cur == "browse":
+            self.tab_browse.load()
+        else:
             self.tab_sessions.load()
 
     def _nav_hover(self, key, enter):
@@ -3014,6 +3329,112 @@ def selftest():
     root.destroy()
     print("   解析(标题/段落/代码块/表格右对齐/有序无序列表/引用/分割线/容错) + 渲染 OK")
     os.remove(pdb)
+    print("== 13. 工作目录 ==")
+    assert dir_name("D:/a/b") == "b" and dir_name("D:\\a\\b") == "b"
+    assert dir_name("D:/a/b/") == "b" and dir_name("D:/a/b\\") == "b"
+    assert dir_name("b") == "b" and dir_name("") == ""
+    assert short_dir("D:/a/b") == os.sep.join(("a", "b")), "同名目录消歧显示不对!"
+    assert short_dir("D:/a/b/c/d") == os.sep.join(("c", "d"))
+    assert short_dir("b") == "b"
+    dtmp = os.path.join(tmp, "ocp-st-dirs")
+    if os.path.isdir(dtmp):
+        shutil.rmtree(dtmp, ignore_errors=True)
+    os.makedirs(os.path.join(dtmp, "inner", "deep"))
+    os.makedirs(os.path.join(dtmp, "empty"))
+    with open(os.path.join(dtmp, "a.txt"), "wb") as f:
+        f.write(b"x" * 1000)
+    with open(os.path.join(dtmp, "inner", "b.txt"), "wb") as f:
+        f.write(b"y" * 2000)
+    with open(os.path.join(dtmp, "inner", "deep", "c.txt"), "wb") as f:
+        f.write(b"z" * 40)
+    total, files, newest = dir_stats(dtmp)
+    print(f"   dir_stats: {total} 字节 / {files} 文件 / mtime {dt.datetime.fromtimestamp(newest):%Y-%m-%d %H:%M}")
+    assert total == 3040 and files == 3, "递归大小/文件数统计不对!"
+    assert newest > 0, "最新修改时间没取到!"
+    assert dir_stats(os.path.join(dtmp, "empty")) == (0, 0, 0.0), "空目录应全为 0!"
+    assert dir_stats(os.path.join(dtmp, "nope")) == (0, 0, 0.0), "不存在的目录应容错返回 0!"
+    st = dirs_stats([dtmp, os.path.join(dtmp, "empty")])
+    assert st[dtmp][0] == 3040 and st[os.path.join(dtmp, "empty")] == (0, 0, 0.0)
+    # session_dirs: 临时库里放"存在的目录"与"已缺失的目录"
+    sdb = os.path.join(tmp, "ocp-st-sdirs.db")
+    if os.path.isfile(sdb):
+        os.remove(sdb)
+    c = sqlite3.connect(sdb)
+    for sql in schema:
+        try:
+            c.execute(sql)
+        except Exception:
+            pass
+    c.execute("insert into project (id,worktree,sandboxes,time_created,time_updated) "
+              "values ('p1','/x','[]',1,1)")
+    for sid, d in (("d1", dtmp), ("d2", dtmp), ("d3", os.path.join(tmp, "ocp-st-gone"))):
+        c.execute("insert into session (id,project_id,slug,directory,title,version,"
+                  "time_created,time_updated) values (?,?,'a',?,'t','v',1,1)", (sid, "p1", d))
+    c.commit()
+    c.close()
+    got = session_dirs(src_path=sdb)
+    print("   会话目录:", [(x["name"], x["sessions"]) for x in got])
+    assert len(got) == 1 and got[0]["path"] == dtmp and got[0]["sessions"] == 2, \
+        "session_dirs 归并/隐藏缺失目录不对!"
+    assert got[0]["exists"] is True and got[0]["name"] == os.path.basename(dtmp)
+    allrows = session_dirs(src_path=sdb, hide_missing=False)
+    assert len(allrows) == 2 and any(not x["exists"] for x in allrows), \
+        "hide_missing=False 时应带出缺失目录并标记!"
+    os.remove(sdb)
+    shutil.rmtree(dtmp, ignore_errors=True)
+    # 列宽自适应: 表头必须放得下
+    root2 = tk.Tk()
+    root2.withdraw()
+    tv = ttk.Treeview(root2, columns=("a",), show="headings")
+    fit_columns(tv, (("a", "更新时间", "w"),), minw=40)
+    w = tv.column("a", "width")
+    assert w >= fit_col_width("更新时间") >= 40, "列宽没有按表头自适应!"
+    assert tv.column("a", "stretch") is False or not tv.column("a", "stretch")
+    tv2 = ttk.Treeview(root2, columns=("a", "b"), show="headings")
+    fit_columns(tv2, (("a", "状态", "w"), ("b", "路径", "w")), stretch_cols=("b",))
+    assert bool(tv2.column("b", "stretch")) and not bool(tv2.column("a", "stretch")), \
+        "拉伸列标记不对!"
+    assert tv2.column("b", "minwidth") >= fit_col_width("路径")
+    root2.destroy()
+    print(f"   路径名称/短名/递归统计/缺失容错/列宽自适应 OK (列宽={w})")
+
+    print("== 14. 内容列宽与布局 ==")
+    root3 = tk.Tk()
+    root3.withdraw()
+    # content_col_width: 内容比表头宽时按内容, 否则回退表头
+    wc = content_col_width(["● 运行中", "空闲"], "状态")
+    wh = fit_col_width("状态")
+    assert wc > wh, "内容比表头宽时应按内容取宽!"
+    assert content_col_width([], "更新时间") == fit_col_width("更新时间", 40), \
+        "没有内容样本时应回退到表头宽度!"
+    assert content_col_width(["x"], "很长很长的表头文字", minw=40) == \
+        fit_col_width("很长很长的表头文字", 40, minw=40), "表头更宽时应按表头!"
+    # fit_columns 的 content_cols 只影响指定列
+    tv3 = ttk.Treeview(root3, columns=("a", "b", "c"), show="headings")
+    fit_columns(tv3, (("a", "状态", "w"), ("b", "标题", "w"), ("c", "路径", "w")),
+                stretch_cols=("c",),
+                content_cols={"a": ["● 运行中"], "b": ["一个相当长的标题内容样本"]})
+    assert tv3.column("a", "width") > fit_col_width("状态"), "content_cols 没生效!"
+    assert tv3.column("b", "width") > fit_col_width("标题"), "content_cols 没生效!"
+    assert bool(tv3.column("c", "stretch")), "拉伸列应保持 stretch!"
+    # caps 必须能限制内容列宽, 避免挤掉拉伸列
+    tv4 = ttk.Treeview(root3, columns=("a", "b"), show="headings")
+    fit_columns(tv4, (("a", "标题", "w"), ("b", "路径", "w")), stretch_cols=("b",),
+                content_cols={"a": ["x" * 200]}, caps={"a": 120})
+    assert tv4.column("a", "width") == 120, f"caps 没生效: {tv4.column('a','width')}"
+    # 工作目录页: hint 必须排在 tree 之前(pack 在 tree 之后会把 tree 宽度钉死)
+    if app_ref is None:
+        bt = BrowseTab(root3)
+        order = [str(x) for x in bt.pack_slaves()]
+        itv = order.index(str(bt.tree))
+        ihint = order.index(str(bt.hint))
+        assert ihint < itv, "工作目录页的 hint 必须排在 tree 之前, 否则窗口拉伸列表不跟随!"
+        assert bt.hint.cget("wraplength") not in ("", "0"), "hint 需要 wraplength!"
+        print(f"   内容列宽 OK (状态={tv3.column('a','width')}, 标题={tv3.column('b','width')})")
+        print("   工作目录页 pack 顺序 OK (hint 在 tree 之前)")
+    else:
+        print(f"   内容列宽 OK (状态={tv3.column('a','width')}, 标题={tv3.column('b','width')})")
+    root3.destroy()
     print("ALL PASS")
 
 
