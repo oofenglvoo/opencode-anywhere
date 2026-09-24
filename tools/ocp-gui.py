@@ -1674,6 +1674,10 @@ class SessionsTab(Fr):
         self.COLS = (("status", "状态", "w"), ("msgs", "消息", "w"), ("size", "大小", "w"),
                      ("title", "标题", "w"), ("dir", "目录", "w"), ("time", "更新时间", "w"),
                      ("path", "路径", "w"))
+        self.sort_key = "time"
+        self.sort_desc = True
+        for cid, label, _a in self.COLS:
+            self.tree.heading(cid, text=label, command=lambda c=cid: self.sort_by(c))
         self.apply_col_widths()
         self.tree.column("path", minwidth=200)
         self.tree.tag_configure("odd", background=ODD)
@@ -1724,6 +1728,43 @@ class SessionsTab(Fr):
                         "time": times,
                     },
                     caps={"status": 88, "msgs": 76, "size": 104, "title": 320, "dir": 250})
+        self._mark_sort_headings()
+
+    def _mark_sort_headings(self):
+        """在当前排序列的表头文字后加 ▲(升序)/▼(降序), 其余列不加."""
+        for cid, label, _a in self.COLS:
+            if cid == self.sort_key:
+                mark = " ▼" if self.sort_desc else " ▲"
+                self.tree.heading(cid, text=label + mark)
+            else:
+                self.tree.heading(cid, text=label)
+
+    def sort_by(self, col):
+        """点击表头: 同一列反复点则切换升/降序, 换列时默认降序(状态/标题默认升序)."""
+        if self.sort_key == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_key, self.sort_desc = col, col not in ("status", "title", "dir")
+        self._mark_sort_headings()
+        self.refresh()
+
+    def _sort_val(self, r):
+        """按当前排序列取排序值; 状态按其 kind 排序(run>act>idle)."""
+        key = self.sort_key
+        if key == "status":
+            order = {"run": 0, "act": 1, "idle": 2}
+            return -order.get(self.smap.get(r[0], ("空闲", "idle", None))[1], 3)
+        if key == "msgs":
+            return r[4] or 0
+        if key == "size":
+            return self.sizes.get(r[0], 0)
+        if key == "title":
+            return (r[1] or "").strip().lower()
+        if key == "dir":
+            return dir_name(r[2]).lower()
+        if key == "path":
+            return (r[2] or "").lower()
+        return r[3] or 0
 
     def load(self):
         if self._loading:
@@ -1791,7 +1832,8 @@ class SessionsTab(Fr):
         keep = set(t.selection())
         t.delete(*t.get_children())
         n = runc = actc = 0
-        for r in self.rows:
+        rows = sorted(self.rows, key=self._sort_val, reverse=self.sort_desc)
+        for r in rows:
             if d != "全部" and r[2] != d:
                 continue
             if kw and kw not in f"{r[1]} {r[2]} {dir_name(r[2])}".lower():
