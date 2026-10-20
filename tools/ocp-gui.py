@@ -1824,6 +1824,286 @@ def session_status_map(sids):
     return out
 
 
+# ---------------- 通知点击回到会话 ----------------
+
+PROTOCOL_SCHEME = "ocp-session"
+WIN_TITLE_PREFIX = "OC | "
+LAUNCHER_FILE = os.path.join(DATA_DIR, "ocp-launcher.json")
+PROTOCOL_FILE = os.path.join(DATA_DIR, "ocp-protocol.json")
+_URI_SID_RE = _re.compile(r"(ses_[A-Za-z0-9]+)")
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+
+def parse_session_uri(raw):
+    """ocp-session:ses_x / ocp-session://ses_x / 裸 ses_x -> ses_x; 非法返回 None."""
+    s = str(raw or "").strip().strip('"').strip("'")
+    if not s:
+        return None
+    if s.lower().startswith(PROTOCOL_SCHEME + ":"):
+        s = s[len(PROTOCOL_SCHEME) + 1:]
+    s = s.lstrip("/")
+    try:
+        s = urllib.parse.unquote(s)
+    except Exception:
+        pass
+    s = s.strip().strip("/").strip()
+    m = _URI_SID_RE.fullmatch(s)
+    return m.group(1) if m else None
+
+
+def launcher_argv():
+    """处理 ocp-session: 协议的命令行前缀(打包 exe 或 pythonw + 源码)."""
+    if _is_frozen():
+        return [os.path.abspath(sys.executable)]
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.isfile(pyw):
+        pyw = sys.executable
+    return [pyw, os.path.abspath(__file__)]
+
+
+def build_protocol_command(argv):
+    """shell\\open\\command 的值: "<exe>" [args...] open-session "%1"."""
+    return " ".join(f'"{a}"' for a in list(argv) + ["open-session", "%1"])
+
+
+def window_title_for(sess_title):
+    return WIN_TITLE_PREFIX + (sess_title or "").strip()
+
+
+def pick_session_window(windows, sess_title):
+    """从 [(hwnd, title)] 里选该会话的窗口; 找不到或不唯一返回 None.
+
+    依次尝试, 某一层恰好命中一个就返回:
+    1) 精确 "OC | <标题>";
+    2) 前缀 "OC | <标题>" + 终端追加的后缀(如 " - 已运行");
+    3) 后缀: 终端在标题前加了东西, 但标题仍在末尾;
+    4) 截断: 终端把长标题截短了, 窗口标题是 <标题> 的前缀.
+    多义(命中多个)一律不猜, 交给调用方新开窗口.
+    """
+    want = (sess_title or "").strip()
+    if not want:
+        return None
+    prefixed = [(h, t) for h, t in windows if t.startswith(WIN_TITLE_PREFIX)]
+    for hits in (
+        [h for h, t in prefixed if t == WIN_TITLE_PREFIX + want],
+        [h for h, t in prefixed if t[len(WIN_TITLE_PREFIX):].startswith(want)],
+        [h for h, t in prefixed if t.endswith(want)],
+        [h for h, t in prefixed
+         if t[len(WIN_TITLE_PREFIX):] and want.startswith(t[len(WIN_TITLE_PREFIX):])],
+    ):
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            return None
+    return None
+
+
+def enum_top_windows():
+    """[(hwnd, title)] 可见且有标题的顶层窗口; 失败返回 []."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        out = []
+        proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            try:
+                if not u.IsWindowVisible(hwnd):
+                    return True
+                n = u.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u.GetWindowTextW(hwnd, buf, n + 1)
+                if buf.value:
+                    out.append((int(hwnd), buf.value))
+            except Exception:
+                pass
+            return True
+
+        u.EnumWindows(proc(_cb), 0)
+        return out
+    except Exception:
+        return []
+
+
+def focus_window(hwnd):
+    """还原并前置窗口.
+
+    Windows 默认禁止后台进程抢前台(SetForegroundWindow 会静默失败), 依次尝试:
+    1) 直接 SetForegroundWindow;
+    2) 模拟一次 ALT 按键解除前台锁定后再试(资源管理器/协议处理器常用做法);
+    3) AttachThreadInput 附加到当前前台线程后再试.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        SW_RESTORE, SW_SHOW = 9, 5
+        VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x0002
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, SW_RESTORE)
+        u.ShowWindow(hwnd, SW_SHOW)
+        if u.SetForegroundWindow(hwnd):
+            return True
+        u.keybd_event(VK_MENU, 0, 0, 0)
+        u.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        if u.SetForegroundWindow(hwnd):
+            return True
+        fg = u.GetForegroundWindow()
+        if not fg:
+            return False
+        tid_fg = wintypes.DWORD()
+        u.GetWindowThreadProcessId(fg, ctypes.byref(tid_fg))
+        tid_me = k.GetCurrentThreadId()
+        u.AttachThreadInput(tid_me, tid_fg.value, True)
+        try:
+            u.BringWindowToTop(hwnd)
+            u.SetForegroundWindow(hwnd)
+        finally:
+            u.AttachThreadInput(tid_me, tid_fg.value, False)
+        return u.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+
+def session_window(sess_title):
+    return pick_session_window(enum_top_windows(), sess_title)
+
+
+def _reg_get(key, name):
+    if winreg is None:
+        return None
+    try:
+        return winreg.QueryValueEx(key, name)[0]
+    except OSError:
+        return None
+
+
+def register_protocol(argv=None):
+    """把 ocp-session: 指向本程序(仅 HKCU, 幂等). 成功返回 True."""
+    if winreg is None:
+        return False
+    argv = list(argv or launcher_argv())
+    command = build_protocol_command(argv)
+    icon = _app_icon_path()
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              r"Software\Classes\ocp-session") as k:
+            for name, value in (("", "URL:ocp-session"), ("URL Protocol", "")):
+                if _reg_get(k, name) != value:
+                    winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              r"Software\Classes\ocp-session\DefaultIcon") as k:
+            if _reg_get(k, "") != icon:
+                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, icon)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              r"Software\Classes\ocp-session\shell\open\command") as k:
+            if _reg_get(k, "") != command:
+                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, command)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              r"Software\Classes\AppUserModelId\OpenCode") as k:
+            for name, value in (("DisplayName", "OpenCode"), ("IconUri", icon)):
+                if _reg_get(k, name) != value:
+                    winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+        try:
+            with open(PROTOCOL_FILE, "w", encoding="utf-8") as f:
+                json.dump({"argv": argv, "command": command,
+                           "at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f,
+                          ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def write_launcher_json():
+    """记下处理通知点击的命令行, 供 opencode 插件按需注册协议."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        argv = launcher_argv()
+        with open(LAUNCHER_FILE, "w", encoding="utf-8") as f:
+            json.dump({"argv": argv}, f, ensure_ascii=False, indent=1)
+        return argv
+    except OSError:
+        return None
+
+
+def _cli_message(title, text, error=False):
+    """无控制台进程(windowed exe)里的提示框; 不能用 print."""
+    try:
+        import ctypes
+        flags = 0x00000010 if error else 0x00000040  # MB_ICONERROR / MB_ICONINFORMATION
+        ctypes.windll.user32.MessageBoxW(0, text, title, flags)
+    except Exception:
+        pass
+
+
+def _ensure_protocol_ready():
+    """GUI 启动后台步骤: 记录 launcher 命令行并注册 ocp-session: 协议."""
+    argv = write_launcher_json()
+    if argv:
+        register_protocol(argv)
+
+
+def open_session_cli(raw):
+    """ocp-session: 处理器: 有窗口就聚焦, 没有就在工作目录新开."""
+    sid = parse_session_uri(raw)
+    if not sid:
+        _cli_message("无法识别会话", f"通知里的会话地址无效:\n{raw}", error=True)
+        return 2
+    con = None
+    try:
+        con = db_ro()
+        row = con.execute("select title, directory from session where id=?",
+                          (sid,)).fetchone()
+    except Exception as e:
+        _cli_message("读取会话失败", str(e), error=True)
+        return 3
+    finally:
+        if con is not None:
+            con.close()
+    if not row:
+        _cli_message("会话不存在",
+                     f"本地库里找不到会话 {sid}。\n可能已被删除，或会话包尚未并入本机。",
+                     error=True)
+        return 4
+    title, directory = (row[0] or "").strip(), (row[1] or "")
+    hwnd = session_window(title)
+    if hwnd:
+        focus_window(hwnd)
+        return 0
+    try:
+        running = sid in running_sessions([sid])
+    except Exception:
+        running = False
+    if running:
+        _cli_message("会话正在运行",
+                     f"会话「{title}」正在运行，但没有找到对应窗口。\n"
+                     "可能是终端标题被改过，请手动切换到该窗口。")
+        return 0
+    d = (directory or "").replace("/", os.sep)
+    if not d or not os.path.isdir(d):
+        _cli_message("工作目录不存在",
+                     f"会话「{title}」的工作目录不存在:\n{d or directory}\n\n"
+                     "请先在本机把项目代码 clone/pull 到该路径。", error=True)
+        return 5
+    exe = find_opencode_exe()
+    if not exe:
+        _cli_message("找不到 opencode", "找不到 opencode 可执行文件，无法打开会话。",
+                     error=True)
+        return 6
+    subprocess.Popen([exe, "--session", sid], cwd=d, env=child_env(),
+                     creationflags=CREATE_NEW_CONSOLE)
+    return 0
+
 
 
 TL = tb.Toplevel if HAS_TB else tk.Toplevel
@@ -3031,6 +3311,9 @@ class App(_AppBase):
         _set_app_identity()
         app_ref = self
         self.after(120, _bg_poll)
+        # 记录处理通知点击的命令行并(幂等)注册 ocp-session: 协议, 让"回到会话"可用.
+        # 放 after 里跑, 避免拖慢首屏; 失败不影响界面.
+        self.after(400, _ensure_protocol_ready)
         setup_style(self, self.theme_name)
         self.minsize(820, 520)
         try:
@@ -3700,25 +3983,67 @@ def selftest():
     else:
         print(f"   内容列宽 OK (状态={tv3.column('a','width')}, 标题={tv3.column('b','width')})")
     root3.destroy()
+    print("== 15. 通知点击回到会话 ==")
+    assert parse_session_uri("ocp-session:ses_abc123XYZ") == "ses_abc123XYZ"
+    assert parse_session_uri("ocp-session://ses_abc123XYZ") == "ses_abc123XYZ"
+    assert parse_session_uri('"ocp-session:ses_abc123XYZ"') == "ses_abc123XYZ"
+    assert parse_session_uri("ocp-session:ses_abc123XYZ/") == "ses_abc123XYZ"
+    assert parse_session_uri("OCP-SESSION:ses_abc123XYZ") == "ses_abc123XYZ"
+    assert parse_session_uri("ses_abc123XYZ") == "ses_abc123XYZ"
+    assert parse_session_uri("ocp-session:") is None
+    assert parse_session_uri("ocp-session:notasession") is None
+    assert parse_session_uri("ocp-session:ses_ab%2Fcd") is None, "编码后的非法字符要拒绝"
+    assert parse_session_uri(None) is None and parse_session_uri("") is None
+    cmd = build_protocol_command([r"C:\a b\opencode-anywhere.exe"])
+    assert cmd == r'"C:\a b\opencode-anywhere.exe" "open-session" "%1"', cmd
+    cmd2 = build_protocol_command([r"C:\py\pythonw.exe", r"C:\x\ocp-gui.py"])
+    assert cmd2 == r'"C:\py\pythonw.exe" "C:\x\ocp-gui.py" "open-session" "%1"', cmd2
+    assert window_title_for("会话同步软件") == "OC | 会话同步软件"
+    wins = [(1, "OC | 会话同步软件"), (2, "OC | poly足球实盘"), (3, "帮助")]
+    assert pick_session_window(wins, "会话同步软件") == 1
+    assert pick_session_window(wins, "poly足球实盘") == 2
+    assert pick_session_window(wins, "不存在的会话") is None
+    assert pick_session_window(wins, "") is None
+    # 终端在标题后追加内容 -> 唯一后缀匹配
+    wins2 = [(1, "OC | 会话同步软件 - 已运行"), (2, "OC | 其他")]
+    assert pick_session_window(wins2, "会话同步软件") == 1
+    # 长标题被终端截断 -> 唯一前缀匹配
+    wins3 = [(1, "OC | Polymarket天气盘口气温"), (2, "OC | 其他会话")]
+    assert pick_session_window(wins3, "Polymarket天气盘口气温事件数据分析") == 1
+    # 多义 -> 不猜
+    wins4 = [(1, "OC | 同名会话 - a"), (2, "OC | 同名会话 - b")]
+    assert pick_session_window(wins4, "同名会话") is None
+    assert pick_session_window([], "x") is None
+    # 精确匹配优先于后缀匹配
+    wins5 = [(1, "OC | abc"), (2, "OC | abc - 副本")]
+    assert pick_session_window(wins5, "abc") == 1
+    print("   URI 解析 / 协议命令 / 窗口标题匹配 OK")
     print("ALL PASS")
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+    args = sys.argv[1:]
+    if args and args[0] in ("open-session", "register-protocol"):
+        # 通知点击入口: 不能进 Tk 主循环, 处理完立即退出
+        if args[0] == "register-protocol":
+            write_launcher_json()
+            return 0 if register_protocol() else 1
+        return open_session_cli(args[1] if len(args) > 1 else "")
+    if args and args[0] == "selftest":
         selftest()
         return
     tab = 0
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "smoke":
+    if args:
+        if args[0] == "smoke":
             app = App()
             app.after(1500, app.destroy)
             app.mainloop()
             print("GUI SMOKE OK")
             return
-        if sys.argv[1].isdigit():
-            tab = int(sys.argv[1])
+        if args[0].isdigit():
+            tab = int(args[0])
     App(tab=tab).mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -3,7 +3,7 @@
   用法: 把项目 tools 文件夹(含本脚本)拷到 B 机任意位置,
         管理员 PowerShell 运行:  powershell -NoProfile -ExecutionPolicy Bypass -File .\install-remote.ps1
   功能: 仅安装环境 - Git/Node/Python/opencode-ai/ttkbootstrap(缺才装)
-        -> 工具脚本进 PATH -> 创建桌面快捷方式
+        -> 工具脚本进 PATH -> 创建桌面快捷方式 -> 部署通知插件
   会话同步: 不需要 Syncthing, 由 GUI([会话管理]+[会话同步]页)把勾选的会话导出成会话包,
             经 GitHub 私库(HTTPS)上传/并入, 本脚本不涉及.
 #>
@@ -61,8 +61,20 @@ try {
     Say "[3] 已创建桌面快捷方式: opencode会话管理" 'Green'
 } catch { Say "[3] 桌面快捷方式创建失败: $_" 'Yellow' }
 
+# ---------- 4. opencode 通知插件(点击通知回到会话) ----------
+$pluginDir = Join-Path $env:USERPROFILE '.config\opencode\plugin'
+$pluginSrc = Join-Path $PSScriptRoot 'session-notify.ts'
+if (Test-Path $pluginSrc) {
+    New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
+    Copy-Item -LiteralPath $pluginSrc -Destination $pluginDir -Force
+    Say "[4] 已部署通知插件: $pluginDir\session-notify.ts" 'Green'
+} else {
+    Say "[4] 未找到 session-notify.ts, 跳过通知插件部署" 'Yellow'
+}
+
 Say ''
 Say '================= 完成, 接下来在 GUI 里配置同步 =================' -ForegroundColor Yellow
 Say '1) 打开本机 GUI:  ocp-gui' -ForegroundColor White
 Say '2) 在[会话同步]页填入 GitHub 私库地址(默认 HTTPS, 填 owner/repo 会自动补全)和 PAT, 点[保存并准备仓库]' -ForegroundColor White
 Say '3) 同步流程: 一端在[会话管理]勾选会话点[上传所选会话] -> 另一端点[刷新远端会话包]后[下载并并入所选]' -ForegroundColor White
+Say '4) 打开一次 GUI 即自动注册 ocp-session: 协议, 之后点击完成提醒可回到对应会话' -ForegroundColor White
