@@ -1573,30 +1573,215 @@ def _bg_poll():
 # ---------------- 会话活跃度检测 ----------------
 
 _WMI_PS = ("Get-CimInstance Win32_Process -Filter \"Name='opencode.exe'\" | "
-           "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+           "Select-Object ProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress")
+
+LOG_FILE = os.path.join(os.path.dirname(DB), "log", "opencode.log")
+LOG_MATCH_TOL = 300.0
+_LOG_LOCK = threading.Lock()
+_LOG_STATE = {"offset": 0, "runs": {}, "head": b""}
+_LOG_LINE_RE = _re.compile(r"^timestamp=(\S+) .*? run=(\w+) message=(.*)", _re.M)
+_LOG_SID_RE = _re.compile(r"session\.id=(ses_[A-Za-z0-9]+)")
+_LOG_TS_RE = _re.compile(r"^timestamp=(\S+)", _re.M)
+# 只有这些消息类型里的 session.id 才是真的"当前会话". 日志同时会记录工具命令文本
+# (message=evaluated ...), 命令里若出现 session.id=... 字样不能被误认.
+_LOG_SESSION_PREFIXES = ("loop ", "process ", "stream ", '"stream ', '"exiting loop"',
+                         "cancel ")
 
 
-def running_sessions():
-    """扫 opencode.exe 命令行里的 --session/-s ses_xxx -> {sid: [pid]}.
-    直接敲 opencode 打开的情况命令行里没有 id, 由 5 分钟时间启发兜底."""
+def _log_epoch(ts):
+    """'2026-10-19T02:34:01.910Z' -> epoch 秒(日志时间戳是 UTC)."""
+    try:
+        return dt.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _cim_epoch(v):
+    """WMI CreationDate -> epoch 秒. ConvertTo-Json 给出 /Date(毫秒)/."""
+    if isinstance(v, (int, float)):
+        return float(v) / 1000
+    s = str(v or "")
+    m = _re.search(r"/Date\((-?\d+)", s)
+    if m:
+        return int(m.group(1)) / 1000
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _log_bootstrap_offset(path, size, target):
+    """从文件尾部向前找第一条 <= target 的日志行, 返回其行首偏移.
+
+    日志可达几十 MB, 首次只回溯到最早运行进程启动前一点, 避免全量扫描.
+    """
+    chunk = 1 << 20
+    pos = size
+    while pos > 0:
+        start = max(0, pos - chunk)
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                text = f.read(pos - start).decode("utf-8", "replace")
+        except OSError:
+            return 0
+        for m in _LOG_TS_RE.finditer(text):
+            ts = _log_epoch(m.group(1))
+            if ts is not None and ts <= target:
+                line_start = text.rfind("\n", 0, m.start())
+                return start + (line_start + 1 if line_start >= 0 else 0)
+        pos = start
+    return 0
+
+
+def _log_ingest(text, runs):
+    """把一段日志并入 {run: {"start": 秒, "sessions": [顶层候选...]}}."""
+    for line in text.splitlines():
+        m = _LOG_LINE_RE.search(line)
+        if not m:
+            continue
+        ts, run, msg = m.groups()
+        info = runs.get(run)
+        if msg.startswith('"creating instance"'):
+            start = _log_epoch(ts)
+            if start is not None and (info is None or info.get("start") is None):
+                runs[run] = {"start": start, "sessions": (info or {}).get("sessions", [])}
+                info = runs[run]
+        if info is None or not msg.startswith(_LOG_SESSION_PREFIXES):
+            continue
+        sid = _LOG_SID_RE.search(msg)
+        if sid:
+            lst = info["sessions"]
+            if not lst or lst[-1] != sid.group(1):
+                lst.append(sid.group(1))
+
+
+def opencode_log_runs(since=None):
+    """增量解析 opencode 日志, 返回 {run: {"start": epoch, "sessions": [...]}}.
+
+    run 是 opencode 单进程的标识, 启动时写一条 creating instance, 之后同 run 的
+    日志行都带当前 session.id. 文件被清空/轮转时自动重建.
+    """
+    path = LOG_FILE
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {}
+    with _LOG_LOCK:
+        st = _LOG_STATE
+        try:
+            with open(path, "rb") as f:
+                head = f.read(128)
+        except OSError:
+            head = b""
+        # 文件头变了说明被清空/轮转后重写(可能已经长过旧偏移), 整体重建
+        if st["head"] and head and head != st["head"]:
+            st["offset"], st["runs"] = 0, {}
+        st["head"] = head
+        if st["offset"] > size:
+            st["offset"], st["runs"] = 0, {}
+        if st["offset"] == 0:
+            st["runs"] = {}
+            target = (since - 600) if since else (_time.time() - 86400)
+            st["offset"] = _log_bootstrap_offset(path, size, target)
+        try:
+            with open(path, "rb") as f:
+                f.seek(st["offset"])
+                chunk = f.read()
+        except OSError:
+            return {k: dict(v) for k, v in st["runs"].items()}
+        if chunk:
+            end = chunk.rfind(b"\n")
+            if end >= 0:
+                st["offset"] += end + 1
+                _log_ingest(chunk[:end + 1].decode("utf-8", "replace"), st["runs"])
+        return {k: {"start": v["start"], "sessions": list(v["sessions"])}
+                for k, v in st["runs"].items()}
+
+
+def _log_session_map(procs, top_level=None, runs=None):
+    """把运行中的 opencode 进程按启动时间对到日志里的 run, 再取该 run 当前会话."""
+    known = [(pid, st) for pid, st in procs if pid is not None and st]
+    if not known:
+        return {}
+    if runs is None:
+        runs = opencode_log_runs(min(st for _pid, st in known))
+    if not runs:
+        return {}
+    pairs = sorted((abs(info["start"] - st), pid, run)
+                   for pid, st in known for run, info in runs.items()
+                   if info.get("start"))
+    used_pid, used_run, mapping = set(), set(), {}
+    for delta, pid, run in pairs:
+        if delta > LOG_MATCH_TOL:
+            break
+        if pid in used_pid or run in used_run:
+            continue
+        used_pid.add(pid)
+        used_run.add(run)
+        mapping[pid] = run
+    top = set(top_level) if top_level is not None else None
     out = {}
+    for pid, run in mapping.items():
+        sessions = runs[run]["sessions"]
+        if top is not None:
+            sessions = [s for s in sessions if s in top]
+        if sessions:
+            out.setdefault(sessions[-1], []).append(pid)
+    return out
+
+
+def _opencode_processes():
+    """WMI 采集 opencode.exe -> [{"ProcessId","CommandLine","CreationDate"}]; 失败返回 []."""
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", _WMI_PS],
                            capture_output=True, timeout=15, env=child_env(),
                            creationflags=CREATE_NO_WINDOW)
         txt = r.stdout.decode("utf-8", "replace").strip()
         if not txt:
-            return out
+            return []
         data = json.loads(txt)
         if isinstance(data, dict):
             data = [data]
-        for p in data:
-            cl = p.get("CommandLine") or ""
-            m = _re.search(r"(?:--session|-s)[= ]+(ses_[A-Za-z0-9]+)", cl)
-            if m:
-                out.setdefault(m.group(1), []).append(p.get("ProcessId"))
+        return data
     except Exception:
-        pass
+        return []
+
+
+def running_sessions(top_level=None):
+    """运行中的会话 -> {sid: [pid]}.
+
+    两条来源合并(日志优先, 因为它反映窗口当前会话):
+    1. 命令行带 --session/-s ses_xxx (从 GUI「进入会话」启动的窗口, 精确);
+    2. opencode 日志: 按进程启动时间对到日志里的 run, 再取该 run 当前 session.id.
+       覆盖直接敲 opencode、-c/--continue、TUI 内切换会话的情况.
+    都对不上时由 5 分钟活动启发兜底.
+    """
+    out = {}
+    procs = _opencode_processes()
+    cmd_map = {}
+    for p in procs:
+        cl = p.get("CommandLine") or ""
+        m = _re.search(r"(?:--session|-s)[= ]+(ses_[A-Za-z0-9]+)", cl)
+        if m and p.get("ProcessId") is not None:
+            cmd_map[p.get("ProcessId")] = m.group(1)
+    try:
+        pairs = [(p.get("ProcessId"), _cim_epoch(p.get("CreationDate"))) for p in procs]
+        log_map = _log_session_map(pairs, top_level)
+    except Exception:
+        log_map = {}
+    # 日志反映的是窗口"当前"会话(可能在 TUI 里切换过), 优先于启动时的命令行;
+    # 命令行只用于日志还没写 session.id 的进程.
+    log_pids = {pid for pids in log_map.values() for pid in pids}
+    for sid, pids in log_map.items():
+        out.setdefault(sid, []).extend(pids)
+    for pid, sid in cmd_map.items():
+        if pid in log_pids:
+            continue
+        lst = out.setdefault(sid, [])
+        if pid not in lst:
+            lst.append(pid)
     return out
 
 
@@ -1625,7 +1810,7 @@ def last_activity_map():
 
 def session_status_map(sids):
     """{sid: (显示文本, kind, pids)}  kind: run / act / idle"""
-    run = running_sessions()
+    run = running_sessions(sids)
     act = last_activity_map()
     now = _time.time() * 1000
     out = {}
@@ -1637,6 +1822,7 @@ def session_status_map(sids):
         else:
             out[sid] = ("空闲", "idle", None)
     return out
+
 
 
 
@@ -3141,9 +3327,46 @@ def selftest():
     assert cmd_re.search('"opencode.exe" -s ses_XY9')
     assert not cmd_re.search('"opencode.exe"')
     print("   命令行解析正则 OK")
+    # 日志关联: 进程启动时间 -> run -> 当前顶层会话
+    assert abs(_log_epoch("2026-10-19T02:34:01.910Z") - 1792377241.910) < 1
+    assert _log_epoch("garbage") is None
+    assert abs(_cim_epoch("/Date(1792377240428)/") - 1792377240.428) < 0.001
+    assert abs(_cim_epoch(1792377240428) - 1792377240.428) < 0.001
+    assert _cim_epoch(None) is None
+    base = 1792377241.910
+    log = "\n".join([
+        f'timestamp=2026-10-19T02:34:01.910Z level=INFO run=aaaa1111 message="creating instance" directory="D:\\\\x"',
+        'timestamp=2026-10-19T02:34:05.000Z level=INFO run=aaaa1111 message=loop session.id=ses_parent',
+        'timestamp=2026-10-19T02:34:06.000Z level=INFO run=aaaa1111 message=loop session.id=ses_child',
+        'timestamp=2026-10-19T02:34:07.000Z level=INFO run=aaaa1111 message=loop session.id=ses_parent',
+        'timestamp=2026-10-19T02:35:00.000Z level=INFO run=bbbb2222 message="creating instance" directory="D:\\\\y"',
+        'timestamp=2026-10-19T02:35:03.000Z level=INFO run=bbbb2222 message=loop session.id=ses_child',
+    ]) + "\n"
+    runs = {}
+    _log_ingest(log, runs)
+    assert runs["aaaa1111"]["sessions"][-1] == "ses_parent", runs
+    assert abs(runs["aaaa1111"]["start"] - base) < 1
+    got = _log_session_map([(100, base + 0.6), (200, base + 61.0)], {"ses_parent"}, runs)
+    assert got == {"ses_parent": [100]}, got          # 子会话被过滤, 只认顶层
+    got = _log_session_map([(300, base + 600)], {"ses_parent"}, runs)
+    assert got == {}, got                             # 启动时间差太远 -> 不匹配
+    got = _log_session_map([(100, base + 0.6), (101, base + 0.7)], {"ses_parent"}, runs)
+    assert got == {"ses_parent": [100]}, got           # 一个 run 只配一个进程
+    got = _log_session_map([(100, base + 0.6)], {"ses_other"}, runs)
+    assert got == {}, got                             # 该 run 没有顶层会话
+    # 日志会记录工具命令文本: 命令里出现的伪时间戳/伪 session.id 不能污染索引
+    polluted = ('timestamp=2026-10-19T02:40:00.000Z level=INFO run=aaaa1111 '
+                'message=evaluated permission=bash pattern="echo timestamp=2026-10-19T01:00:00.000Z '
+                'message=loop session.id=ses_fake"\n')
+    _log_ingest(polluted, runs)
+    assert runs["aaaa1111"]["sessions"][-1] == "ses_parent", runs
+    assert not any("ses_fake" in s for s in runs["aaaa1111"]["sessions"]), runs
+    assert [m.group(1) for m in _LOG_TS_RE.finditer(polluted)] == \
+        ["2026-10-19T02:40:00.000Z"], "日志时间戳必须只在行首匹配"
+    print("   日志关联(进程->run->会话) OK")
     run = running_sessions()
     act = last_activity_map()
-    print(f"   运行中(命令行识别): {run or '无'}")
+    print(f"   运行中(命令行+日志): {run or '无'}")
     print(f"   活动映射覆盖: {len(act)} 个顶层会话")
     if act:
         top = sorted(act.items(), key=lambda kv: -kv[1])[:1]
