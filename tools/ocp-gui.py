@@ -1828,6 +1828,8 @@ def session_status_map(sids):
 
 PROTOCOL_SCHEME = "ocp-session"
 WIN_TITLE_PREFIX = "OC | "
+SW_SHOWNORMAL, SW_SHOWMINIMIZED, SW_SHOWMAXIMIZED, SW_RESTORE = 1, 2, 3, 9
+WPF_RESTORETOMAXIMIZED = 0x0002
 LAUNCHER_FILE = os.path.join(DATA_DIR, "ocp-launcher.json")
 PROTOCOL_FILE = os.path.join(DATA_DIR, "ocp-protocol.json")
 _URI_SID_RE = _re.compile(r"(ses_[A-Za-z0-9]+)")
@@ -1932,8 +1934,43 @@ def enum_top_windows():
         return []
 
 
+def focus_show_plan(show_cmd, flags, iconic, zoomed):
+    """算出聚焦前需要的 ShowWindow 序列, 空元组表示不用动窗口状态.
+
+    XAML 窗口(如 Windows Terminal)收到 SW_SHOW 会套用自己的还原尺寸,
+    导致最大化的窗口缩成小窗口, 所以只在必要时才调用 ShowWindow:
+    1) 最小化 -> SW_RESTORE;
+    2) 本来最大化(含"最大化后被最小化")且现在没最大化 -> 补 SW_MAXIMIZE.
+    """
+    was_max = show_cmd == SW_SHOWMAXIMIZED or bool(flags & WPF_RESTORETOMAXIMIZED)
+    if iconic:
+        return (SW_RESTORE, SW_SHOWMAXIMIZED) if was_max else (SW_RESTORE,)
+    if was_max and not zoomed:
+        return (SW_SHOWMAXIMIZED,)
+    return ()
+
+
+def _window_placement(u, hwnd):
+    """(showCmd, flags); 取不到时按"普通可见窗口"处理."""
+    try:
+        from ctypes import wintypes
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [("length", wintypes.UINT), ("flags", wintypes.UINT),
+                        ("showCmd", wintypes.UINT), ("ptMin", wintypes.POINT),
+                        ("ptMax", wintypes.POINT), ("rcNormal", wintypes.RECT)]
+
+        wp = WINDOWPLACEMENT()
+        wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if u.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+            return wp.showCmd, wp.flags
+    except Exception:
+        pass
+    return SW_SHOWNORMAL, 0
+
+
 def focus_window(hwnd):
-    """还原并前置窗口.
+    """还原并前置窗口, 不改变窗口原本的最大化状态.
 
     Windows 默认禁止后台进程抢前台(SetForegroundWindow 会静默失败), 依次尝试:
     1) 直接 SetForegroundWindow;
@@ -1945,11 +1982,11 @@ def focus_window(hwnd):
         from ctypes import wintypes
         u = ctypes.windll.user32
         k = ctypes.windll.kernel32
-        SW_RESTORE, SW_SHOW = 9, 5
         VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x0002
-        if u.IsIconic(hwnd):
-            u.ShowWindow(hwnd, SW_RESTORE)
-        u.ShowWindow(hwnd, SW_SHOW)
+        iconic = bool(u.IsIconic(hwnd))
+        show_cmd, flags = _window_placement(u, hwnd)
+        for step in focus_show_plan(show_cmd, flags, iconic, bool(u.IsZoomed(hwnd))):
+            u.ShowWindow(hwnd, step)
         if u.SetForegroundWindow(hwnd):
             return True
         u.keybd_event(VK_MENU, 0, 0, 0)
@@ -4017,7 +4054,20 @@ def selftest():
     # 精确匹配优先于后缀匹配
     wins5 = [(1, "OC | abc"), (2, "OC | abc - 副本")]
     assert pick_session_window(wins5, "abc") == 1
-    print("   URI 解析 / 协议命令 / 窗口标题匹配 OK")
+    # 聚焦时不破坏窗口状态: 最大化可见 -> 一次 ShowWindow 都不发
+    assert focus_show_plan(SW_SHOWMAXIMIZED, 0, False, True) == ()
+    # 普通可见 / 吸附 -> 不动
+    assert focus_show_plan(SW_SHOWNORMAL, 0, False, False) == ()
+    # 最小化的普通窗口 -> 只还原
+    assert focus_show_plan(SW_SHOWMINIMIZED, 0, True, False) == (SW_RESTORE,)
+    # 最大化后被最小化 -> 还原 + 补最大化
+    assert focus_show_plan(SW_SHOWMINIMIZED, WPF_RESTORETOMAXIMIZED, True, False) == (
+        SW_RESTORE, SW_SHOWMAXIMIZED)
+    assert focus_show_plan(SW_SHOWMAXIMIZED, WPF_RESTORETOMAXIMIZED, True, False) == (
+        SW_RESTORE, SW_SHOWMAXIMIZED)
+    # 本来最大化但被别人还原了 -> 补回最大化
+    assert focus_show_plan(SW_SHOWMAXIMIZED, 0, False, False) == (SW_SHOWMAXIMIZED,)
+    print("   URI 解析 / 协议命令 / 窗口标题匹配 / 聚焦不动最大化 OK")
     print("ALL PASS")
 
 
