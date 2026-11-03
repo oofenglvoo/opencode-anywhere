@@ -654,6 +654,13 @@ def related_counts(ids):
 
 
 def session_size_map():
+    """每个会话的磁盘占用估算: 内容字节按库文件总大小等比分摊.
+
+    length(data) 对 TEXT 返回字符数(中文占 3 字节), 故用 length(cast(data as blob))
+    取真实字节数. 再按该会话内容字节占比摊分 os.path.getsize(DB), 把索引/页开销/
+    空闲页一并摊给会话, 使"会话合计"恰好等于[会话管理]页显示的"本地会话库"大小.
+    WAL(-wal) 不计入, 与 db_stats 口径一致.
+    """
     child = {}
     roots = set()
     con = db_ro()
@@ -664,13 +671,26 @@ def session_size_map():
             else:
                 roots.add(sid)
         sums = {}
-        for sql in ("select session_id, sum(length(data)) from message group by session_id",
-                    "select session_id, sum(length(data)) from part group by session_id",
-                    "select aggregate_id, sum(length(data)) from event group by aggregate_id"):
+        for sql in ("select session_id, sum(length(cast(data as blob))) "
+                    "from message group by session_id",
+                    "select session_id, sum(length(cast(data as blob))) "
+                    "from part group by session_id",
+                    "select aggregate_id, sum(length(cast(data as blob))) "
+                    "from event group by aggregate_id"):
             for sid, b in con.execute(sql):
                 sums[sid] = sums.get(sid, 0) + (b or 0)
+        try:
+            file_bytes = os.path.getsize(DB)
+        except OSError:
+            try:
+                page_size = con.execute("pragma page_size").fetchone()[0] or 0
+                page_count = con.execute("pragma page_count").fetchone()[0] or 0
+                file_bytes = page_size * page_count
+            except Exception:
+                file_bytes = 0
     finally:
         con.close()
+    raw_total = sum(sums.values())
 
     def top(sid):
         seen = set()
@@ -685,7 +705,16 @@ def session_size_map():
         out[r] = out.get(r, 0) + b
     for r in roots:
         out.setdefault(r, 0)
-    return out
+    if raw_total <= 0 or file_bytes <= 0:
+        return {r: 0 for r in out}
+    base, rem = {}, {}
+    for r, b in out.items():
+        base[r] = b * file_bytes // raw_total
+        rem[r] = b * file_bytes % raw_total
+    leftover = file_bytes - sum(base.values())
+    for r in sorted(rem, key=lambda k: rem[k], reverse=True)[:leftover]:
+        base[r] += 1
+    return base
 
 
 PROMPT_OK, PROMPT_PARTIAL, PROMPT_EMPTY = "ok", "partial", "empty"
@@ -2171,6 +2200,7 @@ class SessionsTab(Fr):
         mkbtn(bar, "查看会话详情", self.view_prompts).pack(side="left", padx=2)
         mkbtn(bar, "上传所选会话", self.upload_selected).pack(side="left", padx=2)
         mkbtn(bar, "删除会话", self.delete_session, "danger").pack(side="left", padx=2)
+        mkbtn(bar, "删除并释放空间", self.delete_and_vacuum, "danger").pack(side="left", padx=2)
         self.toolbar = bar
         cols = ("status", "msgs", "size", "title", "dir", "time", "path")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
@@ -2201,6 +2231,7 @@ class SessionsTab(Fr):
         menu.add_command(label="查看会话详情", command=self.view_prompts)
         menu.add_command(label="上传所选会话", command=self.upload_selected)
         menu.add_command(label="删除会话", command=self.delete_session)
+        menu.add_command(label="删除并释放空间", command=self.delete_and_vacuum)
         self.tree.bind("<Button-3>", lambda e: (self.tree.identify_row(e.y)
                      and self.tree.selection_set(self.tree.identify_row(e.y)),
                      menu.tk_popup(e.x_root, e.y_root)))
@@ -2460,11 +2491,15 @@ class SessionsTab(Fr):
                 "size": human_size(size) if size else "-"}
         PromptDialog(self, sids[0], row[1] or "", row[2] or "", meta)
 
-    def delete_session(self):
+    def _confirm_delete_selection(self, note=""):
+        """勾选+多重确认, 返回待删除的顶层会话 sid 列表(空列表=取消).
+
+        note 非空时追加到"确认删除"弹窗, 用于区分[删除会话]/[删除并释放空间].
+        """
         sids = self.selected()
         if not sids:
             Msg.info("提示", "先在列表中选中会话")
-            return
+            return []
 
         def kind_of(s):
             return self.smap.get(s, ("空闲", "idle", None))[1]
@@ -2477,27 +2512,64 @@ class SessionsTab(Fr):
                         f"{len(run_ids)} 个会话正在 opencode 进程中运行, 不能删除:\n" +
                         "\n".join(f"  · {rows[s][1][:40]}" for s in run_ids[:6]))
         if not rest:
-            return
+            return []
         act_ids = [s for s in rest if kind_of(s) == "act"]
         if act_ids and not Msg.askyesno(
                 "近期活跃确认",
                 f"其中 {len(act_ids)} 个会话最近 5 分钟内有活动, 可能正被某个手动打开的 opencode "
                 "窗口使用(进程命令行识别不到).\n\n确认相关窗口已关闭, 继续?"):
-            return
+            return []
         ids = session_closure(rest)
         counts = related_counts(ids)
         names = "\n".join(f"  · {rows[s][1][:44]}  [{rows[s][2]}]" for s in rest)
+        extra = f"\n\n{note}" if note else ""
         if not Msg.askyesno("确认删除",
                             f"将永久删除 {len(rest)} 个会话(连同子会话共 {len(ids)} 个):\n{names}\n\n"
                             f"连带数据: 消息 {counts['message']} 条 / 数据块 {counts['part']} 条 / "
-                            f"事件 {counts['event']} 条\n\n删除后不可恢复, 确定?"):
-            return
+                            f"事件 {counts['event']} 条{extra}\n\n删除后不可恢复, 确定?"):
+            return []
         if not Msg.askyesno("再次确认", "最终确认: 真的要删除吗?"):
+            return []
+        return rest
+
+    def delete_session(self):
+        rest = self._confirm_delete_selection()
+        if not rest:
             return
         run_bg(lambda: delete_sessions(rest),
                on_ok=lambda gone: (self.load(),
                                    Msg.info("完成", f"已删除 {len(gone)} 个会话(含子会话).")),
                on_err=lambda e: Msg.error("删除失败", str(e)))
+
+    def delete_and_vacuum(self):
+        """删除所选会话后立即 VACUUM 压缩库文件, 把删除释放的空闲页真正还给磁盘."""
+        if opencode_running():
+            Msg.warning("opencode 正在运行",
+                        "删除并释放空间需要先退出全部 opencode 窗口:\n"
+                        "VACUUM 需独占数据库, 且需约两倍磁盘空间的空闲容量.\n\n"
+                        "请退出后重试(本次未执行任何删除).")
+            return
+        rest = self._confirm_delete_selection(
+            note="随后会压缩数据库(VACUUM)释放磁盘空间, 期间不可中断.")
+        if not rest:
+            return
+        self.status.config(text="正在删除并压缩数据库(可能需要一两分钟)...")
+
+        def work():
+            gone = delete_sessions(rest)
+            return gone, vacuum_db()
+
+        def done(r):
+            gone, (before, after) = r
+            self.load()
+            Msg.info("完成", f"已删除 {len(gone)} 个会话(含子会话).\n"
+                             f"数据库 {human_size(before)} → {human_size(after)}")
+
+        def failed(e):
+            self.load()
+            Msg.error("操作失败", f"{e}\n\n若会话已删除但压缩未完成, 请检查数据库后重试.")
+
+        run_bg(work, on_ok=done, on_err=failed)
 
     def upload_selected(self):
         sids = self.selected()
@@ -2816,7 +2888,6 @@ class SyncTab(Fr):
         mkbtn(row2, "刷新远端会话包", self.show_remote).pack(side="left", padx=2)
         mkbtn(row2, "下载并并入所选", self.do_merge, "primary").pack(side="left", padx=2)
         mkbtn(row2, "刷新统计", self.refresh).pack(side="left", padx=2)
-        mkbtn(row2, "压缩数据库(VACUUM)", self.vacuum).pack(side="left", padx=2)
         self.toolbar = rowc
         self.toolbar2 = row2
         L(self, text="上传: 到[会话管理]勾选会话, 点[上传所选会话]导出成独立会话包推送(可多次增量上传).\n"
@@ -2998,29 +3069,6 @@ class SyncTab(Fr):
         self.progress.config(
             text=f"远端共 {len(self._bundles)} 个会话包, 其中 {miss} 个含本机缺少的会话"
                  + (f"; 已按[只看本机缺的包]隐藏 {hidden} 个" if hidden else ""))
-
-    # ---------- 压缩数据库 ----------
-
-    def vacuum(self):
-        if opencode_running():
-            Msg.warning("opencode 正在运行", "请在全部 opencode 退出后再压缩数据库.")
-            return
-        cur = (self._st or {}).get("db", 0)
-        if not Msg.askyesno("压缩数据库",
-                            f"当前库 {human_size(cur)}.\n\n"
-                            "VACUUM 会重建数据库文件, 回收删除会话后残留的空闲页,\n"
-                            "期间需要约两倍磁盘空间, 且必须已退出全部 opencode.\n继续?"):
-            return
-        self.progress.config(text="正在压缩数据库(可能需要一两分钟)...")
-        run_bg(vacuum_db, on_ok=self._vacuumed,
-               on_err=lambda e: (self.progress.config(text=""), Msg.error("压缩失败", str(e))))
-
-    def _vacuumed(self, r):
-        before, after = r
-        self.refresh()
-        self.progress.config(text=f"压缩完成: {human_size(before)} → {human_size(after)}")
-        Msg.info("压缩完成", f"库体积 {human_size(before)} → {human_size(after)}.\n"
-                 "请到[会话管理]按 F5 确认会话数据仍在.")
 
     # ---------- 下载并并入所选 ----------
 
@@ -3590,6 +3638,7 @@ class App(_AppBase):
 
 
 def selftest():
+    global DB
     print("== 1. 会话查询 ==")
     rows = list_sessions()
     print(f"   顶层会话 {len(rows)} 条, 示例: {(rows[0][1] or '')[:20] if rows else '无'}")
@@ -3597,6 +3646,41 @@ def selftest():
     top = sorted(sizes.items(), key=lambda kv: -kv[1])[:3]
     print(f"   会话合计 {human_size(sum(sizes.values()))}; 最大会话: "
           + (", ".join(f"{sid[:16]}... {human_size(b)}" for sid, b in top) if top else "无"))
+    # 会话大小为"内容字节按库文件大小等比分摊": 合计应恰好等于 getsize(DB)
+    _file = os.path.getsize(DB) if os.path.isfile(DB) else 0
+    _tot = sum(sizes.values())
+    assert _tot == _file, f"会话合计 {_tot} != 库文件 {_file}"
+    _bytes = 0
+    _c = db_ro()
+    try:
+        for _t in ("message", "part", "event"):
+            _bytes += _c.execute(
+                f"select sum(length(cast(data as blob))) from {_t}").fetchone()[0] or 0
+    finally:
+        _c.close()
+    assert _tot >= _bytes, "分摊总量含页开销, 不应小于内容字节"
+    print(f"   分摊核对: 合计 {human_size(_tot)} == 库文件 (内容字节 {human_size(_bytes)}) OK")
+    # 空库: 内容字节为 0 时返回空映射, 不崩溃/不除零
+    import tempfile as _tf
+    _empty = os.path.join(_tf.gettempdir(), "ocp-st-size.db")
+    if os.path.isfile(_empty):
+        os.remove(_empty)
+    _e = sqlite3.connect(_empty)
+    for _sql in ("create table session(id text primary key, parent_id text)",
+                 "create table message(session_id text, data text)",
+                 "create table part(session_id text, data text)",
+                 "create table event(aggregate_id text, data text)"):
+        _e.execute(_sql)
+    _e.commit()
+    _e.close()
+    _old_db = DB
+    try:
+        DB = _empty
+        assert session_size_map() == {}, "空库应返回空映射"
+    finally:
+        DB = _old_db
+        os.remove(_empty)
+    print("   空库边界 OK")
     print("== 2. 级联删除 (真实 schema 的内存副本库) ==")
     src = db_ro()
     con = sqlite3.connect(":memory:")
@@ -3640,6 +3724,31 @@ def selftest():
     cfg = load_sync_cfg()
     print(f"   私库: {'已配置 ' + cfg.get('repo_url', '') if cfg.get('repo_url') else '未配置'}"
           f"  工作区就绪: {repo_ready()}  git 可用: {bool(shutil.which('git'))}")
+    # 数据库压缩: 删除大量数据后 VACUUM 应把文件收缩(释放空闲页)
+    import tempfile as _tfv
+    _vdb = os.path.join(_tfv.gettempdir(), "ocp-st-vac.db")
+    if os.path.isfile(_vdb):
+        os.remove(_vdb)
+    _vc = sqlite3.connect(_vdb)
+    _vc.execute("create table t(x blob)")
+    _vc.executemany("insert into t values(?)", [(b"x" * 2048,)] * 2000)
+    _vc.commit()
+    _vc.execute("delete from t where rowid > 10")
+    _vc.commit()
+    _vc.close()
+    _oldv = DB
+    DB = _vdb
+    try:
+        _before, _after = vacuum_db()
+        assert os.path.isfile(_vdb)
+        assert _after < _before, f"VACUUM 后文件应变小: {_before} -> {_after}"
+        _cc = sqlite3.connect(_vdb)
+        assert _cc.execute("select count(*) from t").fetchone()[0] == 10, "压缩后数据应保留!"
+        _cc.close()
+    finally:
+        DB = _oldv
+        os.remove(_vdb)
+    print(f"   数据库压缩: {human_size(_before)} -> {human_size(_after)} (空闲页回收) OK")
     print("== 4. 活跃度检测 ==")
     import re as _r
     cmd_re = _r.compile(r"(?:--session|-s)[= ]+(ses_[A-Za-z0-9]+)")
